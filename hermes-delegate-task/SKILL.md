@@ -1,7 +1,7 @@
 ---
 name: hermes-delegate-task
-description: Route Hermes `delegate_task(background=True)` calls to a named, persistent AgentMint subagent — its `/workspace/MEMORY.md` accumulates context across every delegation, the opposite of Hermes-native delegation which spawns a fresh subagent per call. Polling-only delivery (no public HTTPS required); pay via Stripe-Link (link-cli) or Tempo USDC.e.
-version: 0.2.0
+description: Route Hermes `delegate_task(background=True)` to AgentMint cloud subagents — ephemeral by default (fresh sandbox per call, matches Hermes-native stateless semantics) or persistent (named subagent that accumulates `/workspace/MEMORY.md` across calls). Optional `agentmint_delegate` plugin tool exposes named subagents addressable per call. Polling delivery (no public HTTPS required); pay via Stripe-Link (link-cli).
+version: 0.5.0
 author: AgentMint
 license: MIT
 platforms: [linux, macos]
@@ -13,209 +13,240 @@ metadata:
 
 # AgentMint × Hermes
 
-Long-lived, named, USDC-paid subagents that Hermes can `delegate_task` against. Each subagent has its own bounded sandbox (Upstash Box), its own filesystem that persists across calls (`/workspace/MEMORY.md` is the standard memory anchor), and a stable name (`reviewer-myrepo`, `support-acme`, …). Hibernates to zero between calls — billed only when running.
+Bridges Hermes' `delegate_task(background=True)` to AgentMint cloud subagents — sandboxed Upstash Box runs with independent credentials and isolated filesystems. Hibernate to zero between calls; billed only when running.
+
+## Runtime usage (for the LLM)
+
+After the operator has set this skill up, Hermes' built-in `delegate_task` and (optionally) a new `agentmint_delegate` tool behave as follows. Pick based on what the operator configured:
+
+### Ephemeral mode (default `install_delegate_task_wrapper(dispatcher)`)
+
+Every `delegate_task(background=True)` call mints a FRESH cloud subagent, runs it, and deletes it on completion. Stateless per call — matches Hermes' native semantics exactly, but the subagent runs on isolated AgentMint cloud rather than locally.
+
+- No memory across calls. Subagents don't remember prior dispatches.
+- Multiple `delegate_task(background=True)` in parallel = multiple independent cloud subagents.
+- Use this for fan-out research, code review of independent files, anything where each task is self-contained.
+
+### Persistent mode (operator passed `default_agent_name="..."`)
+
+Every `delegate_task(background=True)` lands in ONE pre-named subagent. Its `/workspace/MEMORY.md` accumulates across calls. The subagent is a specialist that LEARNS.
+
+- Reference prior delegations: "you analyzed Module X last time — what did you find?"
+- Skip re-stating context the subagent already has.
+- Treat it like a colleague that remembers.
+
+### Optional `agentmint_delegate` plugin tool (operator pip-installed the package)
+
+If installed, Hermes exposes an extra tool alongside `delegate_task`:
+
+```
+agentmint_delegate(
+    agent_name="reviewer-myrepo",       # which named specialist
+    goal="Review the diff in /workspace/pr-42",
+    context="Project uses Flask + PyJWT",
+    async_=True,
+)
+```
+
+LLM picks the subagent per call. Use when you want a FLEET of named specialists addressable individually (one per repo, one per customer, one per domain). The result re-injects as a new turn when ready — same UX as `delegate_task(background=True)`.
 
 ## When to use
 
-- Hermes' main session needs a **specialist** (PR reviewer, compliance checker, customer-support agent, codebase oracle, etc.) that accumulates domain knowledge across days/weeks.
-- A task naturally **fans out** into N independent slices and you want each one on its own sandbox.
+- Hermes' main session needs a **specialist** (PR reviewer, compliance checker, customer-support agent, codebase oracle, …) that accumulates domain knowledge across days/weeks → persistent mode or `agentmint_delegate` to a named subagent.
+- A task naturally **fans out** into N independent slices and you want each one on its own isolated cloud sandbox → ephemeral mode.
 - You want **`delegate_task(background=true)`** to dispatch the actual work somewhere with isolated credentials, not the Hermes gateway itself.
-- You want to use a **specific harness × model** combination (e.g. opencode + `openrouter/fusion`, claude-code + claude-sonnet-4-6) without baking those choices into Hermes.
+- You want to use a **specific harness × model** combination (e.g. opencode + `openrouter/fusion`) without baking those choices into Hermes.
 
 Not the right tool when:
 - The task is one-shot and Hermes can answer directly.
 - You need cross-subagent shared state (each subagent's MEMORY is its own).
 
-## Two integration tiers
+## Wallet
 
-### Tier 1 — Direct (no Python, no Hermes code changes)
+AgentMint speaks the same `/a2a` endpoint for both rails, but **the `install_delegate_task_wrapper` flow polls `agent.run.status` which is Bearer-only**, so practically the operator funds AgentMint via Stripe-Link credit wallet (link-cli). Tempo customers can drive AgentMint directly via Tier 1 (curl) but not via the patched/plugin flows below.
 
-Hermes calls AgentMint's JSON-RPC `/a2a` endpoint via `terminal` using whichever wallet skill the user has authenticated. Mint once, run many times.
-
-### Tier 2 — `delegate_task` background dispatch
-
-Pip-install `agentmint-hermes-runner` and wire it into Hermes' gateway. After that, `delegate_task(background=True, …)` results route through PR #40946's async-delegation rail (merged 2026-06-15). Hermes' existing `_async_delegation_watcher` re-injects the result as a new turn in the originating session.
-
-## Wallet matrix
-
-AgentMint speaks the same `/a2a` endpoint for both wallets — pick whichever Hermes already has authenticated.
-
-| Wallet | When | Path |
-|---|---|---|
-| **Stripe-Link** (`link-cli`) | User has a card, no crypto wallet. Best for non-developers. | Bearer JWT against a caller-wide credit wallet — bootstrap once, debits per call |
-| **Tempo Wallet** | User has Tempo wallet authenticated; wants spend controls + service discovery | Per-call x402/MPP, USDC.e on Tempo (`eip155:4217`) |
-
-Fetch the underlying wallet skill via `web_extract` before invoking, so its setup steps are in context:
-
+Fetch the wallet skill via `web_extract` before invoking:
 - `https://agentmint.store/SKILL.md` — full AgentMint API (every method, every rail)
 - Hermes' built-in `stripe-link-cli` skill for `link-cli`
-- Hermes' built-in `mpp-agent` skill for `tempo request`
 
-## Tier 1 — Direct mint + run
+## Setup procedure
 
-### Path A: Stripe-Link (link-cli + credit wallet)
+Pick the mode the operator wants, then follow the corresponding steps.
 
-Bootstrap once, then every subsequent `agent.*` call is Bearer-paid against a shared credit wallet — no Stripe per-call fee.
-
-```bash
-# 1) Bootstrap the wallet (min $10) — via the stripe-link-cli skill
-link-cli mpp pay https://api.agentmint.store/a2a \
-  -X POST -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"credits.topup","params":{"amount_usd":10}}' \
-  --spend-request-id <lsrq_…>
-# → response.access_token = <jwt>   (caller-wide; works for any subagent)
-
-# 2) Mint a subagent (Bearer-paid, 0.10 USDC equivalent debited from wallet)
-curl -X POST https://api.agentmint.store/a2a \
-  -H 'Authorization: Bearer <jwt>' -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"name":"reviewer-myrepo"}}'
-
-# 3) Run the subagent (per-call price debited from the same wallet)
-curl -X POST https://api.agentmint.store/a2a \
-  -H 'Authorization: Bearer <jwt>' -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"agent.run","params":{"name":"reviewer-myrepo","prompt":"…"}}'
-
-# 4) Check the shared balance any time
-curl -X POST https://api.agentmint.store/a2a \
-  -H 'Authorization: Bearer <jwt>' -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"credits.balance","params":{}}'
-```
-
-Same JWT works across every subagent the user mints — one balance, N subagents.
-
-### Path B: Tempo Wallet
+### Step 1 — Bootstrap a Stripe-Link wallet (one-time, all modes)
 
 ```bash
-tempo wallet login           # one-time, browser-based
-tempo wallet whoami          # confirms address + USDC balance
-
-tempo request -X POST \
-  --json '{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"name":"reviewer-myrepo"}}' \
-  https://api.agentmint.store/a2a
-```
-
-Pin to `tempo-request@0.5.2` — newer versions hit "Invalid base64 JSON header" against AgentMint's challenge. Downgrade with `tempo cli 0.0.0 downgrade tempo request cli to 0.5.2`.
-
-## Tier 2 — `delegate_task(background=True)` dispatch (Strategy B)
-
-`install_delegate_task_wrapper` monkey-patches `tools.async_delegation.dispatch_async_delegation` (the PR #40946 hook) so every `delegate_task(background=True, single-task)` call inside Hermes transparently routes to a named, persistent AgentMint subagent. Sync `delegate_task` and batch `delegate_task` are untouched.
-
-Completion is delivered via **polling** against AgentMint's `agent.run.status` endpoint (Bearer-only, free). A daemon thread per dispatch polls every 5 s and pushes completions onto Hermes' `completion_queue` via `_push_completion_event`. No public HTTPS endpoint, no webhook secret, no HTTP route to register — polling is the only delivery mode.
-
-### Step-by-step setup
-
-**Step 1 — Bootstrap an AgentMint wallet (one-time)**
-
-```bash
-# Stripe-Link (recommended, supports polling) — min $10:
-link-cli mpp pay https://api.agentmint.store/a2a \
-  -X POST -H 'Content-Type: application/json' \
+link-cli mpp pay https://api.agentmint.store/a2a -X POST \
+  -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"credits.topup","params":{"amount_usd":10}}'
 # → response.result.access_token = <JWT>
 
 export AGENTMINT_JWT=<the JWT>
 ```
 
-(Tempo path also works, but polling is Bearer-only — Tempo users must use webhook mode, covered in "Webhook mode" below.)
+### Step 2 — pip install the adapter (all modes)
 
-**Step 2 — Pre-mint the subagent (one-time)**
+```bash
+pip install agentmint-hermes-runner   # in Hermes' venv
+```
+
+### Step 3 — pick a mode and wire it
+
+**Ephemeral mode (default — recommended for stateless fan-out):**
+
+No pre-mint needed. Three lines in Hermes gateway startup:
+
+```python
+import os
+from agentmint_hermes_runner import AgentMintDispatcher, BearerAuth, install_delegate_task_wrapper
+
+dispatcher = AgentMintDispatcher(auth=BearerAuth(jwt=os.environ["AGENTMINT_JWT"]))
+install_delegate_task_wrapper(dispatcher)   # no default_agent_name → ephemeral
+```
+
+Cost: ~$0.16 USDC per `delegate_task` call.
+
+**Persistent mode (one specialist that remembers):**
+
+Pre-mint the subagent first:
 
 ```bash
 curl -X POST https://api.agentmint.store/a2a \
   -H "Authorization: Bearer $AGENTMINT_JWT" \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{
-        "name":"default-worker",
-        "harness":"opencode",
-        "model":"openrouter/fusion"}}'
+        "name":"default-worker","harness":"opencode","model":"openrouter/fusion"}}'
 ```
 
-This is the entity that will REMEMBER across every Hermes delegation. Its `/workspace/MEMORY.md` accumulates context across every call. Cost: 0.10 USDC equivalent debited from the credit wallet.
-
-**Step 3 — Install the Python adapter in Hermes' venv**
-
-```bash
-pip install agentmint-hermes-runner
-```
-
-Verify: `python -c "import agentmint_hermes_runner; print(agentmint_hermes_runner.__version__)"` → `0.3.0` or higher.
-
-**Step 4 — Add three lines to your Hermes gateway startup**
-
-Put this in your Hermes gateway entry-point (or wherever you instantiate the gateway), BEFORE any `delegate_task(background=True)` call:
+Then in Hermes gateway startup:
 
 ```python
-import os
-from agentmint_hermes_runner import (
-    AgentMintDispatcher, BearerAuth, install_delegate_task_wrapper,
-)
-
-dispatcher = AgentMintDispatcher(auth=BearerAuth(jwt=os.environ["AGENTMINT_JWT"]))
 install_delegate_task_wrapper(dispatcher, default_agent_name="default-worker")
 ```
 
-That's the entire wiring. The function returns an `uninstall()` callable if you want to undo it later (mostly useful in tests).
+Cost: $0.10 one-time mint + ~$0.05 per `delegate_task` call.
 
-**Step 5 — Restart Hermes and test**
+**Strategy A plugin (named fleet via `agentmint_delegate`):**
 
-Restart the gateway so the new module loads and the patch is in effect. Then from inside a Hermes session:
+Pre-mint each specialist you want addressable (one curl per name). Then in Hermes gateway startup:
+
+```python
+from agentmint_hermes_runner import set_dispatcher
+set_dispatcher(dispatcher)
+```
+
+The `agentmint_delegate` tool auto-registers via Hermes' `hermes_agent.plugins` entry-point discovery. Cost: $0.10 per pre-mint + ~$0.05 per call.
+
+You can combine Strategy A with either ephemeral or persistent — both `delegate_task` and `agentmint_delegate` coexist:
+
+```python
+install_delegate_task_wrapper(dispatcher)   # ephemeral delegate_task
+set_dispatcher(dispatcher)                   # named agentmint_delegate
+```
+
+### Step 4 — Restart Hermes
+
+Restart the gateway so the new modules load and the patch / plugin registration take effect.
+
+### Step 5 — Test
+
+From a Hermes chat:
 
 ```
-> use delegate_task with background=true to ask: "Say hello and tell me what
-  you remember from prior calls."
+> Use delegate_task with background=true: "Say hello and tell me what you remember."
 ```
 
-The LLM will call `delegate_task(background=True, goal="…")`. Behind the scenes:
-1. Adapter calls `agent.run` on AgentMint with `async: true`
-2. AgentMint returns a `run_id` (e.g. `arun_a1b2c3d4`)
-3. Adapter spawns a daemon thread that polls `agent.run.status` every 5 s
-4. AgentMint finishes the run (~15-60 s typically)
-5. Adapter calls `_push_completion_event` → Hermes' `completion_queue`
-6. Hermes' `_async_delegation_watcher` drains and re-injects the result as a new turn
+Behind the scenes the adapter dispatches to AgentMint, polls until done, and re-injects the result as a new turn.
 
-**Step 6 — Verify persistence (the value proposition)**
+For persistent mode or `agentmint_delegate`, you can ask follow-up delegations — the subagent's MEMORY.md will reflect prior calls.
 
-Call `delegate_task(background=true)` twice with different goals against the same Hermes session. The second response should reference details from the first — because `/workspace/MEMORY.md` survived between dispatches. That's the differentiator from Hermes' native `delegate_task` (which always starts fresh).
+## Fleet management — beyond default routing
 
+Even without the `agentmint_delegate` plugin, the Hermes LLM can manage subagents directly via `terminal` + curl. The `delegate_task` patch only handles ONE subagent (the default in persistent mode, or a fresh ephem-* in ephemeral mode); for any other named subagent, use direct `/a2a` calls.
 
-## Hermes `delegate_task` coverage (v0.3)
+### List subagents you own
+
+```bash
+curl -X POST https://api.agentmint.store/a2a \
+  -H "Authorization: Bearer $AGENTMINT_JWT" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{}}'
+```
+
+### Create a new specialist
+
+```bash
+curl -X POST https://api.agentmint.store/a2a \
+  -H "Authorization: Bearer $AGENTMINT_JWT" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{
+        "name":"reviewer-myrepo","harness":"opencode","model":"openrouter/fusion",
+        "persona":"You are a code reviewer specialised in Python web apps."}}'
+```
+
+### Delete an unused subagent
+
+```bash
+curl -X POST https://api.agentmint.store/a2a \
+  -H "Authorization: Bearer $AGENTMINT_JWT" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"agent.delete","params":{"name":"reviewer-myrepo"}}'
+```
+
+### Dispatch to a non-default named subagent
+
+Two options:
+- **With the `agentmint_delegate` plugin installed**: just call the tool. Result re-injects.
+- **Without the plugin**: use direct `agent.run` curl (no re-injection — response is in your terminal stdout):
+
+```bash
+curl -X POST https://api.agentmint.store/a2a \
+  -H "Authorization: Bearer $AGENTMINT_JWT" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"agent.run","params":{
+        "name":"reviewer-myrepo","prompt":"Review the diff..."}}'
+```
+
+## Hermes `delegate_task` coverage (v0.5)
 
 | Hermes feature | AgentMint via this runner | Notes |
 |---|---|---|
-| `goal` | ✅ Concatenated under `## Goal` | `dispatcher.dispatch(goal=…)` |
-| `context` | ✅ Concatenated under `## Context` | Client-side concat — no server-side `context` field |
-| `toolsets=["terminal", "file"]` restrictions | ✅ Soft hints in prompt ("Do not run shell commands.", …) | Sandbox can't structurally enforce; the harness should respect the hint |
-| `toolsets=["web"]` | ❌ **Unsupported** — raises `UnsupportedToolset` | No canonical web-fetch skill in the AgentMint catalog yet; tracked separately |
-| `role="leaf"` / `"orchestrator"` | ✅ Soft hint in prompt | Default `"leaf"` |
-| `max_iterations` | ✅ Soft hint ("Soft iteration budget: ~N actions.") | Harness-dependent enforcement |
-| `tasks=[{…}, {…}]` (batch) | ✅ `dispatcher.dispatch_batch(tasks=…)` — parallel via ThreadPoolExecutor, results in input order | Each Task targets a named subagent |
-| `max_concurrent_children` | ✅ `max_concurrent_children=N` param to `dispatch_batch` | Default 3 |
-| `child_timeout_seconds` | ✅ `child_timeout_seconds=N` param; floor 30s; fires `agent.cancel` on expiry | Single + batch |
-| Interrupt cascade | ✅ `cancel_event=threading.Event` to `dispatch_batch` — fires `agent.cancel` on all in-flight | |
-| `background=True` (PR #40946) | ✅ **`install_delegate_task_wrapper(...)` — Strategy B, polling** | Transparent to the LLM; polling-only |
-| Result ordering (by task index) | ✅ `dispatch_batch` returns in input order regardless of completion order | |
-| `max_spawn_depth` (nested delegation) | n/a | AgentMint sandboxes aren't depth-bounded structurally |
-| `/agents` TUI overlay | n/a | Pure Hermes UI feature; use `dispatcher.list()` to enumerate subagents |
-| Credential inheritance | **better** | Each subagent has its own credentials (no parent key sharing) |
-| "Fresh conversation per call" | **inverted** | AgentMint subagents persist `/workspace/MEMORY.md` across calls — this is the core value |
+| `goal` | ✅ Concatenated under `## Goal` | client-side concat |
+| `context` | ✅ Concatenated under `## Context` | client-side concat |
+| `toolsets=["terminal", "file"]` restrictions | ✅ Soft hints in prompt | sandbox can't structurally enforce |
+| `toolsets=["web"]` | ❌ Unsupported — raises `UnsupportedToolset` | no canonical AgentMint web-fetch skill |
+| `role="leaf"` / `"orchestrator"` | ✅ Soft hint in prompt | |
+| `max_iterations` | ✅ Soft hint | harness-dependent enforcement |
+| `tasks=[{…}, {…}]` (batch) | ✅ Each task ephemeral subagent in parallel | ThreadPoolExecutor + `max_concurrent_children` |
+| `background=True` (PR #40946) | ✅ Ephemeral default; persistent via `default_agent_name` | re-injects via Hermes' `completion_queue` |
+| `agentmint_delegate(agent_name=…, …)` | ✅ NEW tool via plugin entry-point | per-call subagent selection |
+| `max_spawn_depth` | n/a | AgentMint sandboxes aren't depth-bounded |
+| `/agents` TUI overlay | n/a | use `agent.list` via curl to enumerate |
+| Credential inheritance | **better** | each subagent has its own credentials |
+| "Fresh conversation per call" | Ephemeral: same. Persistent: **inverted** | persistence is the value prop in persistent mode |
 
 ## Pitfalls
 
 - **Mode 1 (Stripe-Link) and Mode 2 (Tempo) don't share state.** Funds in the credit wallet (`account:<principal>`) are not transferable to a blockchain address and vice versa. Pick one model per principal.
-- **JWT is caller-wide on Stripe-Link.** One token authorises any agent.* call against any subagent the principal owns. If lost, re-bootstrap via `credits.topup` with no Bearer — the server rotates the canonical jti. The old token is NOT auto-revoked; revoke it explicitly via `credits.revoke_token --jti <jti>` if you know the lost jti.
-- **`name` is global + immutable.** First mint wins. Pick something specific enough to avoid collisions (`reviewer-mesutcelik-agentmint`, not `reviewer`). Released only by `agent.delete`.
+- **JWT is caller-wide on Stripe-Link.** One token authorises any agent.* call against any subagent the principal owns.
+- **`name` is global + immutable.** First mint wins. Pick something specific (`reviewer-mesutcelik-agentmint`, not `reviewer`). Released only by `agent.delete`.
+- **Ephemeral cost compounds**: ~$0.16 × N calls. After ~3-4 calls on the same logical work, persistent is cheaper.
 - **Stripe-MPP only accepts `credits.topup`.** Trying `agent.create` over Stripe-MPP returns `400 use_bearer_after_topup`. Bootstrap with `credits.topup` first.
-- **Tempo broadcast is client-side.** `tempo request` broadcasts before AgentMint's server sees the payment, so a server-side failure after `verify` still leaves the customer charged. Grep server logs for `[agentmint/refund-needed]` for manual operator refund triggers.
-- **Wallet keys never enter Hermes context.** Both wallet skills store credentials under their own config dirs; never `cat`/`read_file` them.
+- **Tempo broadcast is client-side.** `tempo request` broadcasts before AgentMint's server sees the payment, so a server-side failure after `verify` still leaves the customer charged. Grep server logs for `[agentmint/refund-needed]`.
+- **Wallet keys never enter Hermes context.** Wallet skills store credentials under their own config dirs; never `cat`/`read_file` them.
 
 ## Verification
 
 ```bash
-# Confirm the AgentMint endpoint is reachable + supports your wallet
+# Confirm the AgentMint endpoint is reachable
 curl -X POST https://api.agentmint.store/a2a \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{}}'
-# → 402 with accepts[] enumerating supported chains. Pick the one matching your wallet.
+# → 402 with accepts[] enumerating supported rails
+
+# Confirm the plugin entry-point is discovered after pip install:
+python -c "import importlib.metadata as m; print([(e.name,e.value) for e in m.entry_points(group='hermes_agent.plugins')])"
+# → [('agentmint', 'agentmint_hermes_runner.hermes_plugin')]
 ```
 
-For Tier 2, the canary is a complete dispatch + webhook + re-injection cycle. See `examples/stripe_link.py` and `examples/tempo_wallet.py` in the agentmint-hermes repo.
+For mode canaries, see `examples/{ephemeral,persistent,strategy_a_plugin}.py` in the [agentmint-hermes](https://github.com/mesutcelik/agentmint-hermes) repo.
