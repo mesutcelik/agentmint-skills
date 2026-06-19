@@ -1,7 +1,5 @@
 import json
 
-import pytest
-
 from agentmint_hermes_runner.dispatcher import AgentMintDispatcher
 
 
@@ -15,11 +13,15 @@ class FakeAuth:
         return json.dumps({"jsonrpc": "2.0", "id": "x", "result": self._result}).encode()
 
 
-def test_dispatch_async_requires_webhook_url():
-    auth = FakeAuth({"status": "dispatched"})
+def test_dispatch_async_without_webhook_omits_block():
+    auth = FakeAuth({"status": "dispatched", "run_id": "arun_abc"})
     dispatcher = AgentMintDispatcher(auth=auth)
-    with pytest.raises(ValueError, match="webhook_url"):
-        dispatcher.dispatch(agent_name="hello-bot", goal="hi", async_=True)
+    # v0.3+: webhook_url is optional in async mode (caller polls instead).
+    result = dispatcher.dispatch(agent_name="hello-bot", goal="hi", async_=True)
+    assert result.status == "dispatched"
+    params = auth.last_envelope["params"]
+    assert params["async"] is True
+    assert "webhook" not in params
 
 
 def test_dispatch_async_passes_webhook_and_metadata():

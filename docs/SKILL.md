@@ -129,38 +129,29 @@ receiver = AgentMintWebhookReceiver(
 )
 ```
 
-### Dispatch side (Hermes `delegate_tool.py` extension)
+### Strategy B (default in v0.3) — wrap `delegate_task` transparently
+
+The whole wiring collapses to **three lines** plus one CLI mint. No HTTPS endpoint, no webhook secret, no HTTP route — polling against `agent.run.status` does the re-injection.
 
 ```python
-# When background=True and the operator's routing logic targets AgentMint:
-result = dispatcher.dispatch(
-    agent_name="reviewer-myrepo",        # OR agent_id="agt_…"
-    goal=goal_text,
-    files=staged_files,                  # optional, materialised at /workspace/
-    cleanup_paths=["/workspace/pr-42"],  # optional, rm -rf'd after the run
-    async_=True,
-    hermes_context={
-        "session_key": session_key,
-        "toolsets": current_toolsets,
-        "role": "pr-reviewer",
-        "model": "openrouter/fusion",
-    },
+# in Hermes gateway startup (e.g. ~/.hermes/gateway_init.py):
+import os
+from agentmint_hermes_runner import (
+    AgentMintDispatcher, BearerAuth, install_delegate_task_wrapper,
 )
-return {"status": "dispatched", "delegation_id": result.delegation_id, "mode": "background"}
+
+dispatcher = AgentMintDispatcher(auth=BearerAuth(jwt=os.environ["AGENTMINT_JWT"]))
+install_delegate_task_wrapper(dispatcher, default_agent_name="default-worker")
+# That's it. Every delegate_task(background=True) now lands on
+# AgentMint's "default-worker" subagent — its /workspace/MEMORY.md
+# accumulates across every delegation, forever.
 ```
 
-### Webhook side (Hermes gateway HTTP route — Flask example)
+`install_delegate_task_wrapper` monkey-patches `tools.async_delegation.dispatch_async_delegation` (the PR #40946 hook). Sync `delegate_task` and batch `delegate_task` are untouched.
 
-```python
-@app.post("/agentmint-webhook")
-def on_agentmint_webhook():
-    status, body = receiver.handle(dict(request.headers), request.get_data())
-    return body, status
-```
+**Polling specifics:** a daemon thread per dispatch polls `agent.run.status` (Bearer-only, free) every 5 s. On terminal status it calls Hermes' `_push_completion_event` directly. Configurable via `poll_interval=...`.
 
-Hermes' existing `_async_delegation_watcher` drains `completion_queue` when idle and re-injects results as a new turn in the originating session.
-
-If your Hermes fork's completion-event shape diverges from the upstream merged PR #40946, supply your own `event_adapter` to `AgentMintWebhookReceiver`.
+**Webhook mode (opt-in):** pass `delivery="webhook"` and pre-wire `AgentMintWebhookReceiver` to an HTTP route + set `webhook_url` on the dispatcher. Use this when you already have a public HTTPS endpoint and want sub-second-latency re-injection.
 
 ## Procedure summary (recommended)
 
@@ -170,21 +161,21 @@ If your Hermes fork's completion-event shape diverges from the upstream merged P
 4. **Run it** with `agent.run { name: …, prompt: … }` — synchronously by default, or `{ async: true, webhook: { url, headers } }` for background dispatch.
 5. **(Tier 2 only)** Install `agentmint-hermes-runner`, wire it into your gateway extension + webhook route, then use `delegate_task(background=True, …)` against the pre-minted subagent.
 
-## Hermes `delegate_task` coverage (v0.2)
+## Hermes `delegate_task` coverage (v0.3)
 
 | Hermes feature | AgentMint via this runner | Notes |
 |---|---|---|
 | `goal` | ✅ Concatenated under `## Goal` | `dispatcher.dispatch(goal=…)` |
 | `context` | ✅ Concatenated under `## Context` | Client-side concat — no server-side `context` field |
 | `toolsets=["terminal", "file"]` restrictions | ✅ Soft hints in prompt ("Do not run shell commands.", …) | Sandbox can't structurally enforce; the harness should respect the hint |
-| `toolsets=["web"]` | ❌ **Unsupported in v0.2** — raises `UnsupportedToolset` | No canonical web-fetch skill in the AgentMint catalog yet; tracked separately |
+| `toolsets=["web"]` | ❌ **Unsupported** — raises `UnsupportedToolset` | No canonical web-fetch skill in the AgentMint catalog yet; tracked separately |
 | `role="leaf"` / `"orchestrator"` | ✅ Soft hint in prompt | Default `"leaf"` |
 | `max_iterations` | ✅ Soft hint ("Soft iteration budget: ~N actions.") | Harness-dependent enforcement |
 | `tasks=[{…}, {…}]` (batch) | ✅ `dispatcher.dispatch_batch(tasks=…)` — parallel via ThreadPoolExecutor, results in input order | Each Task targets a named subagent |
 | `max_concurrent_children` | ✅ `max_concurrent_children=N` param to `dispatch_batch` | Default 3 |
 | `child_timeout_seconds` | ✅ `child_timeout_seconds=N` param; floor 30s; fires `agent.cancel` on expiry | Single + batch |
 | Interrupt cascade | ✅ `cancel_event=threading.Event` to `dispatch_batch` — fires `agent.cancel` on all in-flight | |
-| `background=True` (PR #40946) | ✅ `async_=True` + `webhook_url` | Re-injects via `AgentMintWebhookReceiver` → `completion_queue` |
+| `background=True` (PR #40946) | ✅ **`install_delegate_task_wrapper(...)` — Strategy B, polling default** | Transparent to the LLM; no webhook required |
 | Result ordering (by task index) | ✅ `dispatch_batch` returns in input order regardless of completion order | |
 | `max_spawn_depth` (nested delegation) | n/a | AgentMint sandboxes aren't depth-bounded structurally |
 | `/agents` TUI overlay | n/a | Pure Hermes UI feature; use `dispatcher.list()` to enumerate subagents |

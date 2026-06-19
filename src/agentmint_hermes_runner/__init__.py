@@ -7,6 +7,7 @@ from .exceptions import (
     DispatchTimeout,
     UnsupportedToolset,
 )
+from .hermes_patch import install_delegate_task_wrapper
 from .models import AgentRecord, DispatchResult, Task
 from .translation import (
     DEFAULT_TOOLSETS,
@@ -17,7 +18,7 @@ from .translation import (
 )
 from .webhook import AgentMintWebhookReceiver
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "AgentMintDispatcher",
@@ -36,5 +37,6 @@ __all__ = [
     "ROLE_HINTS",
     "TOOLSET_RESTRICTION_HINTS",
     "UNSUPPORTED_TOOLSETS",
+    "install_delegate_task_wrapper",
     "__version__",
 ]

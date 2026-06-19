@@ -1,5 +1,5 @@
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any
 
@@ -53,6 +53,15 @@ class AgentMintDispatcher:
     def cancel(self, agent_name: str) -> None:
         self.client.call("agent.cancel", {"name": agent_name})
 
+    def run_status(self, run_id: str) -> dict[str, Any]:
+        """Read the status of an async dispatch by `run_id` (returned from
+        `dispatch(async_=True)`).
+
+        Bearer-only / Stripe-Link-only on the server side (v0.7.0+). Free.
+        Used by the polling delivery mode in `hermes_patch`.
+        """
+        return self.client.call("agent.run.status", {"run_id": run_id})
+
     # ----- single dispatch -----------------------------------------------
 
     def dispatch(
@@ -88,13 +97,15 @@ class AgentMintDispatcher:
         if cleanup_paths:
             params["cleanup_paths"] = cleanup_paths
         if async_:
-            if not self.webhook_url:
-                raise ValueError("webhook_url is required on the dispatcher for async dispatch")
             params["async"] = True
-            webhook: dict[str, Any] = {"url": self.webhook_url}
-            if webhook_headers:
-                webhook["headers"] = webhook_headers
-            params["webhook"] = webhook
+            # Webhook URL is optional in v0.3+ — when omitted, the caller is
+            # expected to poll via `agent.run.status` (cheaper setup, no
+            # public HTTPS endpoint needed).
+            if self.webhook_url:
+                webhook: dict[str, Any] = {"url": self.webhook_url}
+                if webhook_headers:
+                    webhook["headers"] = webhook_headers
+                params["webhook"] = webhook
         if hermes_context:
             params["metadata"] = {"hermes": hermes_context}
 
@@ -200,10 +211,22 @@ class AgentMintDispatcher:
                 watcher.start()
 
             for f in futures:
-                f.result()
+                try:
+                    f.result()
+                except CancelledError:
+                    # The cancel_event watcher cancelled this pending future
+                    # before run_one had a chance to set results[idx]. Leave
+                    # the slot as None; the synthesizer below fills it.
+                    pass
 
-        # Fill any remaining None slots (shouldn't happen, but defensive).
+        # Fill any None slots — either because the watcher cancelled a
+        # pending future, or (defensively) some other untracked path.
+        cancelled = cancel_event is not None and cancel_event.is_set()
+        fallback_status = "interrupted" if cancelled else "failed"
         return [
-            r if r is not None else DispatchResult(status="failed", extra={"error": "no result"})
+            r if r is not None else DispatchResult(
+                status=fallback_status,
+                extra={"error": f"task did not start ({fallback_status})"},
+            )
             for r in results
         ]
