@@ -11,7 +11,7 @@ Route Hermes `delegate_task(background=True)` to named, persistent AgentMint sub
 ## Install in Hermes
 
 ```bash
-hermes skills install mesutcelik/agentmint-hermes/agentmint-hermes
+hermes skills install mesutcelik/agentmint-skills/agentmint-hermes
 ```
 
 (The third segment is the skill subfolder inside the repo, per Hermes' `GitHubSource` convention.)

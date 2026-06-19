@@ -25,9 +25,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/mesutcelik/agentmint-hermes"
-Repository = "https://github.com/mesutcelik/agentmint-hermes"
-Issues = "https://github.com/mesutcelik/agentmint-hermes/issues"
+Homepage = "https://github.com/mesutcelik/agentmint-skills"
+Repository = "https://github.com/mesutcelik/agentmint-skills"
+Issues = "https://github.com/mesutcelik/agentmint-skills/issues"
 
 [project.optional-dependencies]
 dev = [
