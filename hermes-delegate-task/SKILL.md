@@ -207,30 +207,67 @@ curl -X POST https://api.agentmint.store/a2a \
         "name":"reviewer-myrepo","prompt":"Review the diff..."}}'
 ```
 
-## Hermes `delegate_task` coverage (v0.5)
+## Hermes `delegate_task` coverage (v0.6)
 
-| Hermes feature | AgentMint via this runner | Notes |
+Audited against the live Hermes delegation docs. Status notation: ✅ supported, ✅ soft hint = prompt-level only (sandbox can't structurally enforce), ❌ not implemented, n/a = different model / Hermes-internal concern that doesn't reach us.
+
+### Call parameters
+
+| Hermes feature | Status | Notes |
 |---|---|---|
-| `goal` | ✅ Concatenated under `## Goal` | client-side concat |
-| `context` | ✅ Concatenated under `## Context` | client-side concat |
-| `toolsets=["terminal", "file"]` restrictions | ✅ Soft hints in prompt | sandbox can't structurally enforce |
-| `toolsets=["web"]` | ❌ Unsupported — raises `UnsupportedToolset` | no canonical AgentMint web-fetch skill |
-| `role="leaf"` / `"orchestrator"` | ✅ Soft hint in prompt | |
-| `max_iterations` | ✅ Soft hint | harness-dependent enforcement |
-| `tasks=[{…}, {…}]` (batch) | ✅ Each task ephemeral subagent in parallel | ThreadPoolExecutor + `max_concurrent_children` |
-| `background=True` (PR #40946) | ✅ Ephemeral default; persistent via `default_agent_name` | re-injects via Hermes' `completion_queue` |
-| `agentmint_delegate(agent_name=…, …)` | ✅ NEW tool via plugin entry-point | per-call subagent selection |
-| `max_spawn_depth` | n/a | AgentMint sandboxes aren't depth-bounded |
-| `/agents` TUI overlay | n/a | use `agent.list` via curl to enumerate |
-| Credential inheritance | **better** | each subagent has its own credentials |
-| "Fresh conversation per call" | Ephemeral: same. Persistent: **inverted** | persistence is the value prop in persistent mode |
+| `goal` | ✅ | Concatenated under `## Goal` in the synthesized prompt |
+| `context` | ✅ | Concatenated under `## Context`; client-side concat (no server `context` field) |
+| `toolsets=["terminal", "file"]` | ✅ soft hint | Prompt restriction lines ("Do not run shell commands.") |
+| `toolsets=["web"]` | ❌ | Raises `UnsupportedToolset` — no canonical AgentMint web-fetch skill yet |
+| `role="leaf"` / `"orchestrator"` | ✅ soft hint | Prompt-level only; sandbox can't structurally enforce |
+| `max_iterations` | ✅ soft hint | Harness-dependent enforcement inside the sandbox |
+| `tasks=[{…}, {…}]` batch | ✅ | `dispatch_batch` — ThreadPoolExecutor; results returned in input order regardless of completion order |
+| `background=True` (PR #40946) | ✅ | Three modes (see "Operator setup" earlier in this skill): ephemeral via `agent.run.stateless`, persistent via named subagent, or `agentmint_delegate` plugin tool |
+| `agentmint_delegate(agent_name=…, …)` | ✅ | NEW tool via Hermes' `hermes_agent.plugins` entry-point; per-call subagent selection |
+
+### Hermes config knobs (under `delegation:` in `~/.hermes/config.yaml`)
+
+| Hermes feature | Status | Notes |
+|---|---|---|
+| `max_concurrent_children` | ✅ | `max_concurrent_children=N` on `dispatch_batch` (default 3) |
+| `child_timeout_seconds` | ✅ | `child_timeout_seconds=N` on `dispatch` + `dispatch_batch`; floor 30s; fires `agent.cancel` on expiry |
+| `max_spawn_depth` | n/a | AgentMint sandboxes aren't structurally depth-bounded (they cost more, not blocked) |
+| `orchestrator_enabled` | n/a | Hermes-level kill switch; if false, callers never pass `role="orchestrator"` to us anyway |
+| `api_mode` / `model` / `provider` / `base_url` / `api_key` | n/a | These configure Hermes' subagent LLM provider — AgentMint's stateless workers run all-inclusive opencode + openrouter/fusion server-side |
+| `subagent_auto_approve` | n/a | Hermes' approval-callback for in-sandbox dangerous commands — AgentMint runs each box in its own isolated VM; no parent TUI to defer to |
+
+### Lifecycle + interrupt
+
+| Hermes feature | Status | Notes |
+|---|---|---|
+| Synchronicity (`delegate_task` blocks parent turn unless `background=True`) | ✅ | Sync mirrors: our `dispatch()` blocks until completion. `background=True` is the only async path on Hermes side, and that's the path we patch. |
+| Interrupt cascade (parent `/stop` cancels all children) | ✅ | `cancel_event=threading.Event` on `dispatch_batch` fires `agent.cancel` for in-flight dispatches |
+| Status `"interrupted"` on parent interrupt | ✅ | `DispatchResult.status="interrupted"` returned at the cancelled-task slot |
+| Hard-timeout diagnostic dumps | ❌ | Hermes writes `~/.hermes/logs/subagent-timeout-<session>-<timestamp>.log` on zero-call timeout; we just raise `DispatchTimeout` and fire `agent.cancel`. Worth adding if customers need post-mortem on stuck runs. |
+
+### Subagent restrictions
+
+| Hermes feature | Status | Notes |
+|---|---|---|
+| Leaf-blocked tools (`delegation` / `clarify` / `memory` / `code_execution` / `send_message`) | n/a | Different model — AgentMint sandboxes don't expose Hermes' tool registry. The leaf role hint in the prompt is the soft equivalent ("Do not delegate further") |
+| Orchestrator-blocked tools (same set minus `delegation`) | n/a | Same as above — soft prompt hint only |
+| Fresh conversation per call ("subagents know nothing") | Ephemeral: ✅ same. Persistent: **inverted** | Inversion is the core value prop in persistent mode — `/workspace/MEMORY.md` survives every dispatch |
+| Credential inheritance (parent's API key passed to children) | **different model** | Hermes: subagents inherit parent's API key + provider config (key rotation on rate limits). AgentMint: each sandbox runs against AgentMint's server-managed stored keys — no parent credential leakage between sessions or siblings. |
+
+### Hermes-side UI / observability
+
+| Hermes feature | Status | Notes |
+|---|---|---|
+| `/agents` TUI overlay (live tree, kill/pause, post-hoc review) | partial | AgentMint dispatches go through Hermes' `_async_delegation_watcher` for re-injection, but they don't currently register with `_active_subagents` (the registry the TUI reads). The TUI won't show them in the live tree. Use `agent.list` / `agent.run.status` against AgentMint instead. |
+| Per-branch cost / token / file rollups | partial | Available via AgentMint server-side (`agent.runs`, `agent.run.status`'s `billed_usdc` field) but not surfaced into Hermes' TUI views |
+| `delegation.pause` RPC (freeze new fan-out) | n/a | Hermes-level; we don't observe it. If Hermes refuses to dispatch, we never see the call. |
 
 ## Pitfalls
 
 - **Mode 1 (Stripe-Link) and Mode 2 (Tempo) don't share state.** Funds in the credit wallet (`account:<principal>`) are not transferable to a blockchain address and vice versa. Pick one model per principal.
 - **JWT is caller-wide on Stripe-Link.** One token authorises any agent.* call against any subagent the principal owns.
 - **`name` is global + immutable.** First mint wins. Pick something specific (`reviewer-mesutcelik-agentmint`, not `reviewer`). Released only by `agent.delete`.
-- **Ephemeral cost compounds**: ~$0.16 × N calls. After ~3-4 calls on the same logical work, persistent is cheaper.
+- **Ephemeral pricing is smoothed** ($0.01–$0.075 per call, same band as all-inclusive `agent.run`). For a long-running specialist that learns over many calls, persistent mode amortizes the mint cost across all calls.
 - **Stripe-MPP only accepts `credits.topup`.** Trying `agent.create` over Stripe-MPP returns `400 use_bearer_after_topup`. Bootstrap with `credits.topup` first.
 - **Tempo broadcast is client-side.** `tempo request` broadcasts before AgentMint's server sees the payment, so a server-side failure after `verify` still leaves the customer charged. Grep server logs for `[agentmint/refund-needed]`.
 - **Wallet keys never enter Hermes context.** Wallet skills store credentials under their own config dirs; never `cat`/`read_file` them.
