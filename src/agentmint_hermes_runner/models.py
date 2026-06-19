@@ -39,3 +39,23 @@ class DispatchResult:
         kwargs = {k: v for k, v in d.items() if k in known}
         extra = {k: v for k, v in d.items() if k not in known}
         return cls(**kwargs, extra=extra)
+
+
+@dataclass
+class Task:
+    """One task in a `dispatch_batch` call.
+
+    Mirrors Hermes' batch-task shape (`{goal, context, toolsets}`) plus an
+    explicit `agent_name` — each AgentMint task targets a named, persistent
+    subagent (which is the inversion of Hermes' "fresh AIAgent per task").
+    """
+
+    goal: str
+    agent_name: str
+    context: str | None = None
+    toolsets: list[str] | None = None
+    max_iterations: int | None = None
+    role: str = "leaf"
+    files: list[dict] | None = None
+    cleanup_paths: list[str] | None = None
+    hermes_context: dict | None = None

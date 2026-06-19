@@ -1,7 +1,7 @@
 ---
 name: agentmint-hermes
 description: Mint AgentMint pay-as-you-go subagents from Hermes. Provisions a persistent sandbox (Claude Code / Codex / OpenCode harness, any model via OpenRouter) for a long-running task; subsequent `delegate_task(background=true)` calls dispatch to it, hibernate the box between calls, and bill per run. Pay via Stripe-Link (link-cli) or Tempo USDC.e.
-version: 0.1.0
+version: 0.2.0
 author: AgentMint
 license: MIT
 platforms: [linux, macos]
@@ -169,6 +169,27 @@ If your Hermes fork's completion-event shape diverges from the upstream merged P
 3. **Mint the subagent** with `agent.create { name: …, … }` over the chosen rail.
 4. **Run it** with `agent.run { name: …, prompt: … }` — synchronously by default, or `{ async: true, webhook: { url, headers } }` for background dispatch.
 5. **(Tier 2 only)** Install `agentmint-hermes-runner`, wire it into your gateway extension + webhook route, then use `delegate_task(background=True, …)` against the pre-minted subagent.
+
+## Hermes `delegate_task` coverage (v0.2)
+
+| Hermes feature | AgentMint via this runner | Notes |
+|---|---|---|
+| `goal` | ✅ Concatenated under `## Goal` | `dispatcher.dispatch(goal=…)` |
+| `context` | ✅ Concatenated under `## Context` | Client-side concat — no server-side `context` field |
+| `toolsets=["terminal", "file"]` restrictions | ✅ Soft hints in prompt ("Do not run shell commands.", …) | Sandbox can't structurally enforce; the harness should respect the hint |
+| `toolsets=["web"]` | ❌ **Unsupported in v0.2** — raises `UnsupportedToolset` | No canonical web-fetch skill in the AgentMint catalog yet; tracked separately |
+| `role="leaf"` / `"orchestrator"` | ✅ Soft hint in prompt | Default `"leaf"` |
+| `max_iterations` | ✅ Soft hint ("Soft iteration budget: ~N actions.") | Harness-dependent enforcement |
+| `tasks=[{…}, {…}]` (batch) | ✅ `dispatcher.dispatch_batch(tasks=…)` — parallel via ThreadPoolExecutor, results in input order | Each Task targets a named subagent |
+| `max_concurrent_children` | ✅ `max_concurrent_children=N` param to `dispatch_batch` | Default 3 |
+| `child_timeout_seconds` | ✅ `child_timeout_seconds=N` param; floor 30s; fires `agent.cancel` on expiry | Single + batch |
+| Interrupt cascade | ✅ `cancel_event=threading.Event` to `dispatch_batch` — fires `agent.cancel` on all in-flight | |
+| `background=True` (PR #40946) | ✅ `async_=True` + `webhook_url` | Re-injects via `AgentMintWebhookReceiver` → `completion_queue` |
+| Result ordering (by task index) | ✅ `dispatch_batch` returns in input order regardless of completion order | |
+| `max_spawn_depth` (nested delegation) | n/a | AgentMint sandboxes aren't depth-bounded structurally |
+| `/agents` TUI overlay | n/a | Pure Hermes UI feature; use `dispatcher.list()` to enumerate subagents |
+| Credential inheritance | **better** | Each subagent has its own credentials (no parent key sharing) |
+| "Fresh conversation per call" | **inverted** | AgentMint subagents persist `/workspace/MEMORY.md` across calls — this is the core value |
 
 ## Pitfalls
 

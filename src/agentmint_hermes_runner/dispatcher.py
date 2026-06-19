@@ -1,15 +1,25 @@
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any
 
 from .auth.base import Auth
 from .client import Client
-from .models import AgentRecord, DispatchResult
+from .exceptions import DispatchInterrupted, DispatchTimeout
+from .models import AgentRecord, DispatchResult, Task
+from .translation import compose_prompt
+
+CHILD_TIMEOUT_FLOOR = 30.0  # Hermes parity: floor 30s when timeout is enabled
 
 
 class AgentMintDispatcher:
     """High-level wrapper around AgentMint's /a2a JSON-RPC surface.
 
-    One dispatcher per (endpoint, auth, webhook_url) triple. Methods map 1:1
-    to /a2a methods documented at https://agentmint.store/SKILL.md.
+    Translates Hermes' `delegate_task` ergonomics (goal + context + toolsets
+    + role) into AgentMint's single-`prompt` agent.run model. The
+    persistent-sandbox semantics are NOT abstracted — that's the value: a
+    Hermes operator calls `dispatch()` and the work lands in a sandbox
+    whose /workspace survives across calls.
     """
 
     def __init__(
@@ -20,6 +30,8 @@ class AgentMintDispatcher:
     ):
         self.client = Client(endpoint, auth)
         self.webhook_url = webhook_url
+
+    # ----- direct method passthroughs ------------------------------------
 
     def create(self, name: str, **kwargs: Any) -> AgentRecord:
         params = {"name": name, **kwargs}
@@ -38,19 +50,39 @@ class AgentMintDispatcher:
     def delete(self, agent_name: str) -> None:
         self.client.call("agent.delete", {"name": agent_name})
 
+    def cancel(self, agent_name: str) -> None:
+        self.client.call("agent.cancel", {"name": agent_name})
+
+    # ----- single dispatch -----------------------------------------------
+
     def dispatch(
         self,
         agent_name: str,
         goal: str,
+        context: str | None = None,
+        toolsets: list[str] | None = None,
+        role: str = "leaf",
+        max_iterations: int | None = None,
         files: list[dict] | None = None,
         cleanup_paths: list[str] | None = None,
         async_: bool = False,
         hermes_context: dict | None = None,
         webhook_headers: dict[str, str] | None = None,
+        child_timeout_seconds: float | None = None,
     ) -> DispatchResult:
-        """Run a subagent. By default synchronous; pass async_=True to dispatch
-        in the background and receive completion via webhook."""
-        params: dict[str, Any] = {"name": agent_name, "prompt": goal}
+        """Dispatch one task to a named subagent.
+
+        `goal` and `context` are concatenated client-side (Hermes' rule:
+        the parent passes everything). `toolsets` / `role` / `max_iterations`
+        become soft system-prompt hints — AgentMint sandboxes can't
+        structurally enforce them.
+
+        If `child_timeout_seconds` is set, the call is wrapped with a hard
+        cap (floor 30s); on expiry, `agent.cancel` is fired and
+        `DispatchTimeout` is raised.
+        """
+        prompt = compose_prompt(goal, context, toolsets, role, max_iterations)
+        params: dict[str, Any] = {"name": agent_name, "prompt": prompt}
         if files:
             params["files"] = files
         if cleanup_paths:
@@ -65,5 +97,113 @@ class AgentMintDispatcher:
             params["webhook"] = webhook
         if hermes_context:
             params["metadata"] = {"hermes": hermes_context}
-        result = self.client.call("agent.run", params)
+
+        if child_timeout_seconds is None:
+            result = self.client.call("agent.run", params)
+            return DispatchResult.from_dict(result or {})
+
+        cap = max(float(child_timeout_seconds), CHILD_TIMEOUT_FLOOR)
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(self.client.call, "agent.run", params)
+            try:
+                result = future.result(timeout=cap)
+            except FutureTimeoutError as e:
+                try:
+                    self.client.call("agent.cancel", {"name": agent_name})
+                except Exception:
+                    pass
+                raise DispatchTimeout(
+                    f"dispatch of {agent_name!r} exceeded {cap}s; agent.cancel issued"
+                ) from e
         return DispatchResult.from_dict(result or {})
+
+    # ----- batch dispatch ------------------------------------------------
+
+    def dispatch_batch(
+        self,
+        tasks: list[Task],
+        max_concurrent_children: int = 3,
+        child_timeout_seconds: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> list[DispatchResult]:
+        """Fan out N tasks in parallel against named subagents.
+
+        - Results are returned in **input order** (matches Hermes' contract
+          "Results are sorted by task index to match input order regardless
+          of completion order").
+        - Up to `max_concurrent_children` run simultaneously
+          (`ThreadPoolExecutor`).
+        - On exception per task, a `DispatchResult` with `status="failed"`
+          (or `"timeout"` / `"interrupted"`) is inserted at that index — the
+          batch never aborts partial.
+        - `cancel_event` (a `threading.Event`) — when set, in-flight tasks
+          receive a best-effort `agent.cancel` and remaining tasks raise
+          `DispatchInterrupted`.
+        """
+        if max_concurrent_children < 1:
+            raise ValueError("max_concurrent_children must be >= 1")
+        if not tasks:
+            return []
+
+        results: list[DispatchResult | None] = [None] * len(tasks)
+
+        def run_one(idx: int, task: Task) -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                results[idx] = DispatchResult(
+                    status="interrupted",
+                    extra={"error": "cancel_event set before task started"},
+                )
+                return
+            try:
+                results[idx] = self.dispatch(
+                    agent_name=task.agent_name,
+                    goal=task.goal,
+                    context=task.context,
+                    toolsets=task.toolsets,
+                    role=task.role,
+                    max_iterations=task.max_iterations,
+                    files=task.files,
+                    cleanup_paths=task.cleanup_paths,
+                    hermes_context=task.hermes_context,
+                    child_timeout_seconds=child_timeout_seconds,
+                )
+            except DispatchTimeout as e:
+                results[idx] = DispatchResult(status="timeout", extra={"error": str(e)})
+            except DispatchInterrupted as e:
+                results[idx] = DispatchResult(status="interrupted", extra={"error": str(e)})
+            except Exception as e:
+                results[idx] = DispatchResult(
+                    status="failed",
+                    extra={"error": str(e), "type": type(e).__name__},
+                )
+
+        watcher: threading.Thread | None = None
+        with ThreadPoolExecutor(max_workers=max_concurrent_children) as ex:
+            futures = [ex.submit(run_one, i, t) for i, t in enumerate(tasks)]
+
+            if cancel_event is not None:
+                def watch() -> None:
+                    cancel_event.wait()
+                    for f in futures:
+                        f.cancel()
+                    seen: set[str] = set()
+                    for t in tasks:
+                        if t.agent_name in seen:
+                            continue
+                        seen.add(t.agent_name)
+                        try:
+                            self.client.call("agent.cancel", {"name": t.agent_name})
+                        except Exception:
+                            pass
+
+                watcher = threading.Thread(target=watch, daemon=True)
+                watcher.start()
+
+            for f in futures:
+                f.result()
+
+        # Fill any remaining None slots (shouldn't happen, but defensive).
+        return [
+            r if r is not None else DispatchResult(status="failed", extra={"error": "no result"})
+            for r in results
+        ]

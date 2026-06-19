@@ -36,7 +36,8 @@ def test_dispatch_async_passes_webhook_and_metadata():
     assert result.delegation_id == "del_1"
     params = auth.last_envelope["params"]
     assert params["name"] == "hello-bot"
-    assert params["prompt"] == "hi"
+    # v0.2: prompt is composed (goal under ## Goal, plus role hint).
+    assert "## Goal\nhi" in params["prompt"]
     assert params["async"] is True
     assert params["webhook"] == {"url": "https://hook.example/wh", "headers": {"X-Custom": "1"}}
     assert params["metadata"] == {"hermes": {"session_key": "abc"}}
@@ -49,6 +50,7 @@ def test_dispatch_sync_omits_webhook_block():
     params = auth.last_envelope["params"]
     assert "webhook" not in params
     assert "async" not in params
+    assert "## Goal\nhi" in params["prompt"]
 
 
 def test_create_returns_agent_record():
