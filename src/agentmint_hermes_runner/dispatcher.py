@@ -26,10 +26,8 @@ class AgentMintDispatcher:
         self,
         auth: Auth,
         endpoint: str = "https://api.agentmint.store/a2a",
-        webhook_url: str | None = None,
     ):
         self.client = Client(endpoint, auth)
-        self.webhook_url = webhook_url
 
     # ----- direct method passthroughs ------------------------------------
 
@@ -76,7 +74,6 @@ class AgentMintDispatcher:
         cleanup_paths: list[str] | None = None,
         async_: bool = False,
         hermes_context: dict | None = None,
-        webhook_headers: dict[str, str] | None = None,
         child_timeout_seconds: float | None = None,
     ) -> DispatchResult:
         """Dispatch one task to a named subagent.
@@ -85,6 +82,9 @@ class AgentMintDispatcher:
         the parent passes everything). `toolsets` / `role` / `max_iterations`
         become soft system-prompt hints — AgentMint sandboxes can't
         structurally enforce them.
+
+        Async dispatches return immediately with a `run_id`; poll
+        completion via `run_status(run_id)`.
 
         If `child_timeout_seconds` is set, the call is wrapped with a hard
         cap (floor 30s); on expiry, `agent.cancel` is fired and
@@ -98,14 +98,6 @@ class AgentMintDispatcher:
             params["cleanup_paths"] = cleanup_paths
         if async_:
             params["async"] = True
-            # Webhook URL is optional in v0.3+ — when omitted, the caller is
-            # expected to poll via `agent.run.status` (cheaper setup, no
-            # public HTTPS endpoint needed).
-            if self.webhook_url:
-                webhook: dict[str, Any] = {"url": self.webhook_url}
-                if webhook_headers:
-                    webhook["headers"] = webhook_headers
-                params["webhook"] = webhook
         if hermes_context:
             params["metadata"] = {"hermes": hermes_context}
 

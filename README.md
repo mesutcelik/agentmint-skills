@@ -6,9 +6,9 @@ Route Hermes `delegate_task(background=True)` to named, persistent AgentMint sub
 
 ## Status
 
-**v0.3.0** — alpha. Auth backends: `BearerAuth` (Stripe-Link), `TempoAuth` (Tempo USDC.e). Hermes feature coverage matrix in [`docs/SKILL.md`](docs/SKILL.md).
+**v0.4.0** — alpha. Auth backends: `BearerAuth` (Stripe-Link), `TempoAuth` (Tempo USDC.e). Polling-only delivery. Hermes feature coverage matrix in [`docs/SKILL.md`](docs/SKILL.md).
 
-## Three-line Hermes wiring (Strategy B, polling default)
+## Three-line Hermes wiring (Strategy B)
 
 ```python
 import os
@@ -20,7 +20,7 @@ dispatcher = AgentMintDispatcher(auth=BearerAuth(jwt=os.environ["AGENTMINT_JWT"]
 install_delegate_task_wrapper(dispatcher, default_agent_name="default-worker")
 ```
 
-Every `delegate_task(background=True)` inside Hermes now routes to AgentMint's `default-worker` subagent. Its `/workspace/MEMORY.md` accumulates across every delegation. No HTTPS, no ngrok, no webhook secret — a daemon thread polls `agent.run.status` (free, Bearer-only) and pushes completions onto Hermes' `completion_queue` directly. Server-side requires AgentMint API ≥ 0.7.0 for the polling endpoint.
+Every `delegate_task(background=True)` inside Hermes now routes to AgentMint's `default-worker` subagent. Its `/workspace/MEMORY.md` accumulates across every delegation. No HTTPS, no ngrok, no webhook secret — a daemon thread polls `agent.run.status` (free, Bearer-only) every 5 s and pushes completions onto Hermes' `completion_queue` directly. Server-side requires AgentMint API ≥ 0.7.0 for the polling endpoint.
 
 ## Install
 

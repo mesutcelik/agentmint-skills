@@ -100,14 +100,6 @@ def test_install_patches_dispatch_async_delegation(fake_hermes):
     assert fake_hermes["async_delegation"].dispatch_async_delegation is original
 
 
-def test_install_rejects_unknown_delivery(fake_hermes):
-    from agentmint_hermes_runner.hermes_patch import install_delegate_task_wrapper
-
-    dispatcher = AgentMintDispatcher(auth=FakeAuth({}))
-    with pytest.raises(ValueError, match="delivery must be"):
-        install_delegate_task_wrapper(dispatcher, default_agent_name="x", delivery="ftp")
-
-
 def test_patched_falls_back_to_native_on_error(fake_hermes):
     from agentmint_hermes_runner.hermes_patch import install_delegate_task_wrapper
 

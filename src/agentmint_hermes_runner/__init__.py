@@ -16,13 +16,11 @@ from .translation import (
     UNSUPPORTED_TOOLSETS,
     compose_prompt,
 )
-from .webhook import AgentMintWebhookReceiver
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "AgentMintDispatcher",
-    "AgentMintWebhookReceiver",
     "BearerAuth",
     "TempoAuth",
     "AgentRecord",

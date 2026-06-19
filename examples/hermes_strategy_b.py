@@ -41,7 +41,6 @@ def main() -> None:
         dispatcher=dispatcher,
         default_agent_name="default-worker",
         poll_interval=5.0,
-        delivery="poll",
     )
     # From here on, every delegate_task(background=True) call inside Hermes
     # routes to the AgentMint subagent named "default-worker". Its

@@ -13,45 +13,43 @@ class FakeAuth:
         return json.dumps({"jsonrpc": "2.0", "id": "x", "result": self._result}).encode()
 
 
-def test_dispatch_async_without_webhook_omits_block():
+def test_dispatch_async_emits_async_flag():
     auth = FakeAuth({"status": "dispatched", "run_id": "arun_abc"})
     dispatcher = AgentMintDispatcher(auth=auth)
-    # v0.3+: webhook_url is optional in async mode (caller polls instead).
     result = dispatcher.dispatch(agent_name="hello-bot", goal="hi", async_=True)
     assert result.status == "dispatched"
     params = auth.last_envelope["params"]
     assert params["async"] is True
+    # v0.4+: webhook support removed; "webhook" never appears in params.
     assert "webhook" not in params
 
 
-def test_dispatch_async_passes_webhook_and_metadata():
+def test_dispatch_async_passes_metadata():
     auth = FakeAuth({"status": "dispatched", "delegation_id": "del_1"})
-    dispatcher = AgentMintDispatcher(auth=auth, webhook_url="https://hook.example/wh")
+    dispatcher = AgentMintDispatcher(auth=auth)
     result = dispatcher.dispatch(
         agent_name="hello-bot",
         goal="hi",
         async_=True,
         hermes_context={"session_key": "abc"},
-        webhook_headers={"X-Custom": "1"},
     )
     assert result.status == "dispatched"
     assert result.delegation_id == "del_1"
     params = auth.last_envelope["params"]
     assert params["name"] == "hello-bot"
-    # v0.2: prompt is composed (goal under ## Goal, plus role hint).
     assert "## Goal\nhi" in params["prompt"]
     assert params["async"] is True
-    assert params["webhook"] == {"url": "https://hook.example/wh", "headers": {"X-Custom": "1"}}
+    assert "webhook" not in params  # v0.4+: webhook support removed entirely
     assert params["metadata"] == {"hermes": {"session_key": "abc"}}
 
 
-def test_dispatch_sync_omits_webhook_block():
+def test_dispatch_sync_omits_async_flag():
     auth = FakeAuth({"status": "ok"})
     dispatcher = AgentMintDispatcher(auth=auth)
     dispatcher.dispatch(agent_name="hello-bot", goal="hi")
     params = auth.last_envelope["params"]
-    assert "webhook" not in params
     assert "async" not in params
+    assert "webhook" not in params
     assert "## Goal\nhi" in params["prompt"]
 
 

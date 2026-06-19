@@ -6,9 +6,9 @@ Sync `delegate_task` is untouched (Hermes-native fan-out / batch behaviour
 preserved). Multi-task `background=True` is rejected upstream in Hermes
 itself, so we never see it.
 
-The default delivery is **polling** against AgentMint's `agent.run.status`
-(Bearer-only, free) — no public HTTPS endpoint required. Pass
-`delivery="webhook"` to use the original webhook receiver instead.
+Completion is delivered exclusively via **polling** against AgentMint's
+`agent.run.status` endpoint (Bearer-only, free). No public HTTPS endpoint,
+no webhook secret, no HTTP route to register.
 """
 import logging
 import threading
@@ -27,7 +27,6 @@ def install_delegate_task_wrapper(
     dispatcher: AgentMintDispatcher,
     default_agent_name: str,
     poll_interval: float = 5.0,
-    delivery: str = "poll",
 ) -> Callable[[], None]:
     """Patch Hermes' async-delegation rail to route through AgentMint.
 
@@ -46,14 +45,7 @@ def install_delegate_task_wrapper(
     poll_interval : float
         Seconds between `agent.run.status` polls (default 5.0). The
         polling thread uses exponential backoff on errors up to 60s.
-    delivery : str
-        "poll" (default) or "webhook". With "webhook", the caller is
-        expected to have wired `AgentMintWebhookReceiver` into an HTTP
-        route already.
     """
-    if delivery not in ("poll", "webhook"):
-        raise ValueError(f"delivery must be 'poll' or 'webhook', got {delivery!r}")
-
     try:
         import tools.async_delegation as _ad
     except ImportError as e:
@@ -87,15 +79,14 @@ def install_delegate_task_wrapper(
             if not run_id:
                 raise RuntimeError("AgentMint async dispatch returned no run_id")
 
-            if delivery == "poll":
-                _spawn_poller(
-                    dispatcher=dispatcher,
-                    run_id=run_id,
-                    goal=goal,
-                    context=context,
-                    session_key=session_key,
-                    poll_interval=poll_interval,
-                )
+            _spawn_poller(
+                dispatcher=dispatcher,
+                run_id=run_id,
+                goal=goal,
+                context=context,
+                session_key=session_key,
+                poll_interval=poll_interval,
+            )
 
             return {
                 "status": "dispatched",
@@ -113,8 +104,8 @@ def install_delegate_task_wrapper(
     _ad.dispatch_async_delegation = patched
     logger.info(
         "agentmint-hermes: installed delegate_task wrapper "
-        "(default_agent=%s, delivery=%s, poll_interval=%.1fs)",
-        default_agent_name, delivery, poll_interval,
+        "(default_agent=%s, poll_interval=%.1fs)",
+        default_agent_name, poll_interval,
     )
 
     def uninstall() -> None:

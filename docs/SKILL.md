@@ -96,11 +96,11 @@ tempo request -X POST \
 
 Pin to `tempo-request@0.5.2` — newer versions hit "Invalid base64 JSON header" against AgentMint's challenge. Downgrade with `tempo cli 0.0.0 downgrade tempo request cli to 0.5.2`.
 
-## Tier 2 — `delegate_task(background=True)` dispatch (Strategy B, polling default)
+## Tier 2 — `delegate_task(background=True)` dispatch (Strategy B)
 
 `install_delegate_task_wrapper` monkey-patches `tools.async_delegation.dispatch_async_delegation` (the PR #40946 hook) so every `delegate_task(background=True, single-task)` call inside Hermes transparently routes to a named, persistent AgentMint subagent. Sync `delegate_task` and batch `delegate_task` are untouched.
 
-**Polling default** — a daemon thread polls `agent.run.status` (Bearer-only, free) every 5 s and pushes completions onto Hermes' `completion_queue` via `_push_completion_event`. No public HTTPS endpoint, no webhook secret, no HTTP route to register.
+Completion is delivered via **polling** against AgentMint's `agent.run.status` endpoint (Bearer-only, free). A daemon thread per dispatch polls every 5 s and pushes completions onto Hermes' `completion_queue` via `_push_completion_event`. No public HTTPS endpoint, no webhook secret, no HTTP route to register — polling is the only delivery mode.
 
 ### Step-by-step setup
 
@@ -177,38 +177,6 @@ The LLM will call `delegate_task(background=True, goal="…")`. Behind the scene
 
 Call `delegate_task(background=true)` twice with different goals against the same Hermes session. The second response should reference details from the first — because `/workspace/MEMORY.md` survived between dispatches. That's the differentiator from Hermes' native `delegate_task` (which always starts fresh).
 
-### Webhook mode (opt-in — only if you already have a public HTTPS endpoint)
-
-Skip Steps 4 above. Use this instead:
-
-```python
-import os
-from agentmint_hermes_runner import (
-    AgentMintDispatcher, AgentMintWebhookReceiver, BearerAuth,
-    install_delegate_task_wrapper,
-)
-from hermes.gateway.process_registry import completion_queue
-
-dispatcher = AgentMintDispatcher(
-    auth=BearerAuth(jwt=os.environ["AGENTMINT_JWT"]),
-    webhook_url=os.environ["AGENTMINT_WEBHOOK_URL"],  # public HTTPS
-)
-receiver = AgentMintWebhookReceiver(
-    signing_secret=os.environ["AGENTMINT_WEBHOOK_SIGNING_SECRET"],
-    completion_queue=completion_queue,
-)
-install_delegate_task_wrapper(
-    dispatcher, default_agent_name="default-worker", delivery="webhook",
-)
-
-# Register the route on your gateway's Flask/FastAPI app:
-@app.post("/agentmint-webhook")
-def on_agentmint_webhook():
-    status, body = receiver.handle(dict(request.headers), request.get_data())
-    return body, status
-```
-
-Sub-second-latency re-injection at the cost of needing a publicly-reachable HTTPS endpoint and HMAC secret coordination. Use polling unless you have a measured need.
 
 ## Hermes `delegate_task` coverage (v0.3)
 
@@ -224,7 +192,7 @@ Sub-second-latency re-injection at the cost of needing a publicly-reachable HTTP
 | `max_concurrent_children` | ✅ `max_concurrent_children=N` param to `dispatch_batch` | Default 3 |
 | `child_timeout_seconds` | ✅ `child_timeout_seconds=N` param; floor 30s; fires `agent.cancel` on expiry | Single + batch |
 | Interrupt cascade | ✅ `cancel_event=threading.Event` to `dispatch_batch` — fires `agent.cancel` on all in-flight | |
-| `background=True` (PR #40946) | ✅ **`install_delegate_task_wrapper(...)` — Strategy B, polling default** | Transparent to the LLM; no webhook required |
+| `background=True` (PR #40946) | ✅ **`install_delegate_task_wrapper(...)` — Strategy B, polling** | Transparent to the LLM; polling-only |
 | Result ordering (by task index) | ✅ `dispatch_batch` returns in input order regardless of completion order | |
 | `max_spawn_depth` (nested delegation) | n/a | AgentMint sandboxes aren't depth-bounded structurally |
 | `/agents` TUI overlay | n/a | Pure Hermes UI feature; use `dispatcher.list()` to enumerate subagents |
@@ -238,7 +206,6 @@ Sub-second-latency re-injection at the cost of needing a publicly-reachable HTTP
 - **`name` is global + immutable.** First mint wins. Pick something specific enough to avoid collisions (`reviewer-mesutcelik-agentmint`, not `reviewer`). Released only by `agent.delete`.
 - **Stripe-MPP only accepts `credits.topup`.** Trying `agent.create` over Stripe-MPP returns `400 use_bearer_after_topup`. Bootstrap with `credits.topup` first.
 - **Tempo broadcast is client-side.** `tempo request` broadcasts before AgentMint's server sees the payment, so a server-side failure after `verify` still leaves the customer charged. Grep server logs for `[agentmint/refund-needed]` for manual operator refund triggers.
-- **Async webhook delivery is via Upstash QStash.** Customer endpoint must be reachable from the public internet and signature-verify `X-AgentMint-Signature` (HMAC-SHA256 over `${timestamp}.${raw_body}`).
 - **Wallet keys never enter Hermes context.** Both wallet skills store credentials under their own config dirs; never `cat`/`read_file` them.
 
 ## Verification
