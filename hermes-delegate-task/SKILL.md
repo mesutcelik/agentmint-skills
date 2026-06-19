@@ -126,7 +126,7 @@ install_delegate_task_wrapper(dispatcher, default_agent_name="default-worker")
 
 Cost: $0.10 one-time mint + ~$0.05 per `delegate_task` call.
 
-**Strategy A plugin (named fleet via `agentmint_delegate`):**
+**Plugin tool (named fleet via `agentmint_delegate`):**
 
 Pre-mint each specialist you want addressable (one curl per name). Then in Hermes gateway startup:
 
@@ -137,7 +137,7 @@ set_dispatcher(dispatcher)
 
 The `agentmint_delegate` tool auto-registers via Hermes' `hermes_agent.plugins` entry-point discovery. Cost: $0.10 per pre-mint + ~$0.05 per call.
 
-You can combine Strategy A with either ephemeral or persistent — both `delegate_task` and `agentmint_delegate` coexist:
+You can combine the plugin tool with either ephemeral or persistent mode — both `delegate_task` and `agentmint_delegate` coexist:
 
 ```python
 install_delegate_task_wrapper(dispatcher)   # ephemeral delegate_task
@@ -249,4 +249,4 @@ python -c "import importlib.metadata as m; print([(e.name,e.value) for e in m.en
 # → [('agentmint', 'agentmint_hermes_runner.hermes_plugin')]
 ```
 
-For mode canaries, see `examples/{ephemeral,persistent,strategy_a_plugin}.py` in the [agentmint-hermes](https://github.com/mesutcelik/agentmint-hermes) repo.
+For mode canaries, see `examples/{ephemeral,persistent,plugin}.py` in the [agentmint-hermes](https://github.com/mesutcelik/agentmint-hermes) repo.
