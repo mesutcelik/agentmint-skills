@@ -390,10 +390,21 @@ Save the `agent_id` — you need it for every subsequent call. The harness/model
     "cleanup_paths": [                                      // optional. server runs `rm -rf` on each
       "/workspace/pr-42",                                   //   path after the run completes. paths
       "/workspace/tmp/upload.txt"                           //   must live under /workspace/ and use
-    ]                                                       //   [A-Za-z0-9._/-] only — no wildcards,
+    ],                                                      //   [A-Za-z0-9._/-] only — no wildcards,
                                                             //   no parent-dir traversal. Use this for
                                                             //   per-call temp files; MEMORY.md / any
                                                             //   un-listed path persists across runs.
+    "workspace_files": [                                    // optional. server writes each file into
+      {                                                     //   the sandbox via box.files.write BEFORE
+        "path": "/workspace/pr-42.diff",                    //   the run starts. paths same regex as
+        "content": "diff --git a/foo.py ..."                //   cleanup_paths. content is a string;
+      },                                                    //   set "encoding":"base64" for binaries.
+      {                                                     //   max 10 files, 10 MB each. Pair with
+        "path": "/workspace/logo.png",                      //   cleanup_paths if you want them wiped
+        "content": "iVBORw0KGgo...",                        //   after the run (otherwise they persist
+        "encoding": "base64"                                //   in /workspace like everything else).
+      }
+    ]
   }
 }
 ```
