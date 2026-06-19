@@ -1,91 +1,27 @@
-# agentmint-hermes-runner
+# agentmint-skills
 
-Route Hermes `delegate_task(background=True)` to named, persistent AgentMint subagents.
+A catalog of [Hermes](https://github.com/NousResearch/hermes-agent)-installable skills for [AgentMint](https://agentmint.store).
 
-> Positioning + full quickstart in [`agentmint-hermes/SKILL.md`](agentmint-hermes/SKILL.md).
+Each skill lives in its own subfolder containing a `SKILL.md`. Skills tell the Hermes agent how to do something with AgentMint; the actual implementation (Python adapter, CLI, etc.) lives in its own separate repo.
 
-## Status
+## Available skills
 
-**v0.4.0** — alpha. Auth backends: `BearerAuth` (Stripe-Link), `TempoAuth` (Tempo USDC.e). Polling-only delivery. Hermes feature coverage matrix in [`agentmint-hermes/SKILL.md`](agentmint-hermes/SKILL.md).
+| Skill | What it does | Install |
+|---|---|---|
+| [`agentmint-hermes`](agentmint-hermes/SKILL.md) | Route Hermes `delegate_task(background=True)` to named, persistent AgentMint subagents | `hermes skills install mesutcelik/agentmint-skills/agentmint-hermes` |
 
-## Install in Hermes
+## Related repos
 
-```bash
-hermes skills install mesutcelik/agentmint-skills/agentmint-hermes
-```
+- **[mesutcelik/agentmint-hermes](https://github.com/mesutcelik/agentmint-hermes)** — Python adapter (`agentmint-hermes-runner` on PyPI) that the `agentmint-hermes` skill installs and wires into Hermes' gateway.
+- **AgentMint API** — full spec at <https://agentmint.store/SKILL.md> (canonical for wallets, payment rails, every JSON-RPC method).
 
-(The third segment is the skill subfolder inside the repo, per Hermes' `GitHubSource` convention.)
+## Adding a new skill
 
-## Three-line Hermes wiring (Strategy B)
-
-```python
-import os
-from agentmint_hermes_runner import (
-    AgentMintDispatcher, BearerAuth, install_delegate_task_wrapper,
-)
-
-dispatcher = AgentMintDispatcher(auth=BearerAuth(jwt=os.environ["AGENTMINT_JWT"]))
-install_delegate_task_wrapper(dispatcher, default_agent_name="default-worker")
-```
-
-Every `delegate_task(background=True)` inside Hermes now routes to AgentMint's `default-worker` subagent. Its `/workspace/MEMORY.md` accumulates across every delegation. No HTTPS, no ngrok, no webhook secret — a daemon thread polls `agent.run.status` (free, Bearer-only) every 5 s and pushes completions onto Hermes' `completion_queue` directly. Server-side requires AgentMint API ≥ 0.7.0 for the polling endpoint.
-
-## Install
-
-```bash
-pip install agentmint-hermes-runner
-```
-
-## Surface
-
-```python
-from agentmint_hermes_runner import (
-    AgentMintDispatcher,
-    AgentMintWebhookReceiver,
-    BearerAuth, TempoAuth,
-    Task,
-)
-
-dispatcher = AgentMintDispatcher(
-    auth=BearerAuth(jwt=os.environ["AGENTMINT_JWT"]),
-    webhook_url="https://my-gateway.example.com/agentmint-webhook",  # optional
-)
-
-# Single dispatch (Hermes delegate_task analog):
-result = dispatcher.dispatch(
-    agent_name="reviewer-myrepo",
-    goal="Review the diff in /workspace/pr-42 and flag risks.",
-    context="Project at /workspace, Python 3.11, uses Flask + PyJWT.",
-    toolsets=["terminal", "file"],   # "web" raises UnsupportedToolset in v0.2
-    role="leaf",                      # or "orchestrator"
-    max_iterations=50,
-    child_timeout_seconds=600,        # floor 30s; fires agent.cancel on expiry
-)
-
-# Batch dispatch (Hermes tasks=[…] analog):
-results = dispatcher.dispatch_batch(
-    tasks=[
-        Task(agent_name="researcher-wasm", goal="WASM 2026 survey", context="…"),
-        Task(agent_name="researcher-riscv", goal="RISC-V 2026 survey", context="…"),
-    ],
-    max_concurrent_children=3,
-    child_timeout_seconds=900,
-)
-# results in input order; failed/timeout/interrupted statuses returned in-band
-```
-
-## Test
-
-```bash
-pip install -e ".[dev]"
-pytest
-ruff check .
-```
-
-## Known unsupported (v0.2)
-
-- **`toolsets=["web"]`** — no canonical AgentMint web-fetch skill yet. The supported harnesses (claude-code / codex / opencode) all have built-in web access via the harness itself, but we don't expose a Hermes-symmetric toolset for it. Raises `UnsupportedToolset` at compose time so the gap is loud, not silent.
-- **`max_spawn_depth`** — AgentMint sandboxes aren't structurally bounded by depth.
+1. Create a new subfolder named after the skill (must match the `name:` in the SKILL.md frontmatter).
+2. Drop a `SKILL.md` inside, following the [Hermes skill format](https://hermes-agent.nousresearch.com/docs/user-guide/skills) (frontmatter + procedural body).
+3. Reference the implementation by its package name (PyPI, npm, etc.) — don't bundle code here.
+4. Add an entry to the table above.
+5. Commit + push. Hermes' `GitHubSource` picks it up via `hermes skills install mesutcelik/agentmint-skills/<skill-name>`.
 
 ## License
 
