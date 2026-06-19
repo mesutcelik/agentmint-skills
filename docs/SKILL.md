@@ -96,45 +96,55 @@ tempo request -X POST \
 
 Pin to `tempo-request@0.5.2` — newer versions hit "Invalid base64 JSON header" against AgentMint's challenge. Downgrade with `tempo cli 0.0.0 downgrade tempo request cli to 0.5.2`.
 
-## Tier 2 — `delegate_task(background=True)` dispatch
+## Tier 2 — `delegate_task(background=True)` dispatch (Strategy B, polling default)
 
-Pre-mint the subagent (any of the paths above), then wire the Python adapter into Hermes' gateway. The adapter ships at <https://github.com/mesutcelik/agentmint-hermes>.
+`install_delegate_task_wrapper` monkey-patches `tools.async_delegation.dispatch_async_delegation` (the PR #40946 hook) so every `delegate_task(background=True, single-task)` call inside Hermes transparently routes to a named, persistent AgentMint subagent. Sync `delegate_task` and batch `delegate_task` are untouched.
 
-### Install
+**Polling default** — a daemon thread polls `agent.run.status` (Bearer-only, free) every 5 s and pushes completions onto Hermes' `completion_queue` via `_push_completion_event`. No public HTTPS endpoint, no webhook secret, no HTTP route to register.
+
+### Step-by-step setup
+
+**Step 1 — Bootstrap an AgentMint wallet (one-time)**
+
+```bash
+# Stripe-Link (recommended, supports polling) — min $10:
+link-cli mpp pay https://api.agentmint.store/a2a \
+  -X POST -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"credits.topup","params":{"amount_usd":10}}'
+# → response.result.access_token = <JWT>
+
+export AGENTMINT_JWT=<the JWT>
+```
+
+(Tempo path also works, but polling is Bearer-only — Tempo users must use webhook mode, covered in "Webhook mode" below.)
+
+**Step 2 — Pre-mint the subagent (one-time)**
+
+```bash
+curl -X POST https://api.agentmint.store/a2a \
+  -H "Authorization: Bearer $AGENTMINT_JWT" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{
+        "name":"default-worker",
+        "harness":"opencode",
+        "model":"openrouter/fusion"}}'
+```
+
+This is the entity that will REMEMBER across every Hermes delegation. Its `/workspace/MEMORY.md` accumulates context across every call. Cost: 0.10 USDC equivalent debited from the credit wallet.
+
+**Step 3 — Install the Python adapter in Hermes' venv**
 
 ```bash
 pip install agentmint-hermes-runner
 ```
 
-### Wire-up
+Verify: `python -c "import agentmint_hermes_runner; print(agentmint_hermes_runner.__version__)"` → `0.3.0` or higher.
+
+**Step 4 — Add three lines to your Hermes gateway startup**
+
+Put this in your Hermes gateway entry-point (or wherever you instantiate the gateway), BEFORE any `delegate_task(background=True)` call:
 
 ```python
-import os
-from agentmint_hermes_runner import (
-    AgentMintDispatcher,
-    AgentMintWebhookReceiver,
-    BearerAuth,        # OR: TempoAuth
-)
-from hermes.gateway.process_registry import completion_queue   # merged PR #40946 rail
-
-dispatcher = AgentMintDispatcher(
-    endpoint="https://api.agentmint.store/a2a",
-    auth=BearerAuth(jwt=os.environ["AGENTMINT_JWT"]),       # OR: TempoAuth(account="tempo")
-    webhook_url="https://my-gateway.example.com/agentmint-webhook",
-)
-
-receiver = AgentMintWebhookReceiver(
-    signing_secret=os.environ["AGENTMINT_WEBHOOK_SIGNING_SECRET"],
-    completion_queue=completion_queue,
-)
-```
-
-### Strategy B (default in v0.3) — wrap `delegate_task` transparently
-
-The whole wiring collapses to **three lines** plus one CLI mint. No HTTPS endpoint, no webhook secret, no HTTP route — polling against `agent.run.status` does the re-injection.
-
-```python
-# in Hermes gateway startup (e.g. ~/.hermes/gateway_init.py):
 import os
 from agentmint_hermes_runner import (
     AgentMintDispatcher, BearerAuth, install_delegate_task_wrapper,
@@ -142,24 +152,63 @@ from agentmint_hermes_runner import (
 
 dispatcher = AgentMintDispatcher(auth=BearerAuth(jwt=os.environ["AGENTMINT_JWT"]))
 install_delegate_task_wrapper(dispatcher, default_agent_name="default-worker")
-# That's it. Every delegate_task(background=True) now lands on
-# AgentMint's "default-worker" subagent — its /workspace/MEMORY.md
-# accumulates across every delegation, forever.
 ```
 
-`install_delegate_task_wrapper` monkey-patches `tools.async_delegation.dispatch_async_delegation` (the PR #40946 hook). Sync `delegate_task` and batch `delegate_task` are untouched.
+That's the entire wiring. The function returns an `uninstall()` callable if you want to undo it later (mostly useful in tests).
 
-**Polling specifics:** a daemon thread per dispatch polls `agent.run.status` (Bearer-only, free) every 5 s. On terminal status it calls Hermes' `_push_completion_event` directly. Configurable via `poll_interval=...`.
+**Step 5 — Restart Hermes and test**
 
-**Webhook mode (opt-in):** pass `delivery="webhook"` and pre-wire `AgentMintWebhookReceiver` to an HTTP route + set `webhook_url` on the dispatcher. Use this when you already have a public HTTPS endpoint and want sub-second-latency re-injection.
+Restart the gateway so the new module loads and the patch is in effect. Then from inside a Hermes session:
 
-## Procedure summary (recommended)
+```
+> use delegate_task with background=true to ask: "Say hello and tell me what
+  you remember from prior calls."
+```
 
-1. **`web_extract` the full AgentMint API** from `https://agentmint.store/SKILL.md` (every method, parameter, error code).
-2. **Pick a wallet** from the table above based on what the user has already authenticated. If unclear, default to `link-cli` for non-developers; Tempo for users with a funded USDC.e wallet.
-3. **Mint the subagent** with `agent.create { name: …, … }` over the chosen rail.
-4. **Run it** with `agent.run { name: …, prompt: … }` — synchronously by default, or `{ async: true, webhook: { url, headers } }` for background dispatch.
-5. **(Tier 2 only)** Install `agentmint-hermes-runner`, wire it into your gateway extension + webhook route, then use `delegate_task(background=True, …)` against the pre-minted subagent.
+The LLM will call `delegate_task(background=True, goal="…")`. Behind the scenes:
+1. Adapter calls `agent.run` on AgentMint with `async: true`
+2. AgentMint returns a `run_id` (e.g. `arun_a1b2c3d4`)
+3. Adapter spawns a daemon thread that polls `agent.run.status` every 5 s
+4. AgentMint finishes the run (~15-60 s typically)
+5. Adapter calls `_push_completion_event` → Hermes' `completion_queue`
+6. Hermes' `_async_delegation_watcher` drains and re-injects the result as a new turn
+
+**Step 6 — Verify persistence (the value proposition)**
+
+Call `delegate_task(background=true)` twice with different goals against the same Hermes session. The second response should reference details from the first — because `/workspace/MEMORY.md` survived between dispatches. That's the differentiator from Hermes' native `delegate_task` (which always starts fresh).
+
+### Webhook mode (opt-in — only if you already have a public HTTPS endpoint)
+
+Skip Steps 4 above. Use this instead:
+
+```python
+import os
+from agentmint_hermes_runner import (
+    AgentMintDispatcher, AgentMintWebhookReceiver, BearerAuth,
+    install_delegate_task_wrapper,
+)
+from hermes.gateway.process_registry import completion_queue
+
+dispatcher = AgentMintDispatcher(
+    auth=BearerAuth(jwt=os.environ["AGENTMINT_JWT"]),
+    webhook_url=os.environ["AGENTMINT_WEBHOOK_URL"],  # public HTTPS
+)
+receiver = AgentMintWebhookReceiver(
+    signing_secret=os.environ["AGENTMINT_WEBHOOK_SIGNING_SECRET"],
+    completion_queue=completion_queue,
+)
+install_delegate_task_wrapper(
+    dispatcher, default_agent_name="default-worker", delivery="webhook",
+)
+
+# Register the route on your gateway's Flask/FastAPI app:
+@app.post("/agentmint-webhook")
+def on_agentmint_webhook():
+    status, body = receiver.handle(dict(request.headers), request.get_data())
+    return body, status
+```
+
+Sub-second-latency re-injection at the cost of needing a publicly-reachable HTTPS endpoint and HMAC secret coordination. Use polling unless you have a measured need.
 
 ## Hermes `delegate_task` coverage (v0.3)
 
