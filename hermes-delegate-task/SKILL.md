@@ -1,6 +1,6 @@
 ---
-name: agentmint-hermes
-description: Mint AgentMint pay-as-you-go subagents from Hermes. Provisions a persistent sandbox (Claude Code / Codex / OpenCode harness, any model via OpenRouter) for a long-running task; subsequent `delegate_task(background=true)` calls dispatch to it, hibernate the box between calls, and bill per run. Pay via Stripe-Link (link-cli) or Tempo USDC.e.
+name: hermes-delegate-task
+description: Route Hermes `delegate_task(background=True)` calls to a named, persistent AgentMint subagent — its `/workspace/MEMORY.md` accumulates context across every delegation, the opposite of Hermes-native delegation which spawns a fresh subagent per call. Polling-only delivery (no public HTTPS required); pay via Stripe-Link (link-cli) or Tempo USDC.e.
 version: 0.2.0
 author: AgentMint
 license: MIT
