@@ -157,10 +157,26 @@ When gathering inputs from a human before provisioning, ask in this exact order 
 | `agent.get`    | 0.01 USDC | payer / principal = owner | Read agent metadata |
 | `agent.delete` | 0.01 USDC | payer / principal = owner | Destroy the subagent |
 | `agent.list`   | 0.01 USDC | payer / principal = owner | Enumerate all subagents owned by the caller (`limit` default 50, max 200; `offset` for paging) |
+| `agent.run.stateless` | smoothed 0.01–0.075 USDC (same band as `agent.run` all-inclusive) | **Bearer only** (Stripe-Link credit wallet) | Dispatch a prompt to a pool-backed worker. No name needed; AgentMint mints/reuses a generic `opencode` + `openrouter/fusion` worker. `/workspace` is wiped per call (stateless). Matches Hermes-native `delegate_task` semantics with cloud isolation. No `persona`, `skills`, or `api_key` allowed. |
 | `credits.topup` | ≥ $10 USD | **Stripe-MPP only**. No Bearer = bootstrap (mints JWT). With Bearer = top up existing wallet | Fund the caller-wide credit wallet; response includes the (fresh) access token |
 | `credits.balance` | free | `Authorization: Bearer <jwt>` | Read caller-wide balance |
 | `credits.revoke_token` | free | `Authorization: Bearer <jwt>` | Revoke a specific jti for the caller |
 | `credits.history` | free | `Authorization: Bearer <jwt>` | Per-event ledger: every topup, debit, refund for the caller |
+
+### Stateless runs (`agent.run.stateless`)
+
+`agent.run.stateless` is a pool-backed dispatch that matches Hermes-native `delegate_task(background=True)` semantics — fresh state per call, but the run executes on an isolated AgentMint cloud sandbox instead of locally.
+
+Behavior:
+- **No name, no `agent_id`** — just `{ prompt, async?, files?, cleanup_paths?, timeout_ms?, options?, webhook? }`.
+- **Zero cold start** — AgentMint maintains a small fixed pool of pre-minted keep-alive workers. Acquiring one is instant; running is the only latency.
+- **All-inclusive only** — `opencode` harness + `openrouter/fusion` model. No BYOK, no persona, no custom skills.
+- **`/workspace` is wiped on every call** via `cleanup_paths=["/workspace"]` (server-enforced). No state carries between leases.
+- **Smoothed pricing** — same band as all-inclusive `agent.run` ($0.01–$0.075 per call), keyed at the principal level (not per-agent, since stateless has no `AgentRecord`).
+- **No `AgentRecord` persisted** — stateless runs don't appear in `agent.list` and don't have a name.
+- **Pool exhaustion** — if all pool members are leased, the request is rejected with `pool exhausted`; retry shortly. Failed runs are fully refunded.
+
+Use this when you want one-shot delegated work in an isolated cloud sandbox. For a persistent specialist that remembers across calls, use `agent.create` + `agent.run` instead.
 
 ## Caller-wide credit wallet (Stripe-Link only)
 
