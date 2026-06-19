@@ -2,11 +2,19 @@
 
 Route Hermes `delegate_task(background=True)` to named, persistent AgentMint subagents.
 
-> Positioning + full quickstart in `docs/SKILL.md`.
+> Positioning + full quickstart in [`agentmint-hermes/SKILL.md`](agentmint-hermes/SKILL.md).
 
 ## Status
 
-**v0.4.0** — alpha. Auth backends: `BearerAuth` (Stripe-Link), `TempoAuth` (Tempo USDC.e). Polling-only delivery. Hermes feature coverage matrix in [`docs/SKILL.md`](docs/SKILL.md).
+**v0.4.0** — alpha. Auth backends: `BearerAuth` (Stripe-Link), `TempoAuth` (Tempo USDC.e). Polling-only delivery. Hermes feature coverage matrix in [`agentmint-hermes/SKILL.md`](agentmint-hermes/SKILL.md).
+
+## Install in Hermes
+
+```bash
+hermes skills install mesutcelik/agentmint-hermes/agentmint-hermes
+```
+
+(The third segment is the skill subfolder inside the repo, per Hermes' `GitHubSource` convention.)
 
 ## Three-line Hermes wiring (Strategy B)
 
