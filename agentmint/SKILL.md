@@ -6,7 +6,7 @@ metadata:
   endpoint: https://api.agentmint.store/a2a
   agent_card: https://api.agentmint.store/.well-known/agent-card.json
   cli: https://www.npmjs.com/package/agentmint-cli
-  version: "0.4.1"
+  version: "0.4.2"
 ---
 
 # agentmint
@@ -235,39 +235,72 @@ link-cli payment-methods list                  # confirm you have a card on file
 **Bootstrap a wallet via `credits.topup`** (no Bearer; first Stripe charge):
 
 ```sh
-# 1. Decode the 402 challenge to extract the Stripe network-id
+# 1. Decode the 402 challenge to extract the Stripe network-id.
+#    `tr -d '\r'` is REQUIRED — curl emits CRLF header lines and sed alone
+#    leaves a trailing \r that breaks `link-cli mpp decode`.
 CHAL=$(curl -sI -X POST https://api.agentmint.store/a2a \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"credits.topup","params":{"amount_usd":10}}' \
-  | grep -i www-authenticate | sed 's/^[^:]*: //')
+  | grep -i '^www-authenticate:' | sed 's/^[^:]*: //' | tr -d '\r')
 link-cli mpp decode --challenge "$CHAL"        # prints network_id: profile_...
 
-# 2. Create + request approval for the bootstrap spend
+# 2. List payment methods to find the right id. Real IDs from link-cli are
+#    `csmrpd_…` or `csmrpd*…` — NOT the Stripe `pm_…` format. Use whatever
+#    `id` field comes back.
+link-cli payment-methods list --format json | \
+  jq -r '.[] | [.id, .type, (.card_details.last4 // .bank_account_details.last4)] | @tsv'
+
+# 3. Create + request approval. Note: --context has a 100-char MINIMUM
+#    (silently rejected if shorter). The default --request-approval=true is
+#    NON-blocking — it creates the request and returns `pending_approval`
+#    immediately with an approval_url.
 link-cli spend-request create \
   --credential-type shared_payment_token \
   --network-id profile_… \
-  --payment-method-id pm_… \
+  --payment-method-id 'csmrpd_…' \
   --amount 1000 --currency usd \
-  --context "Bootstrap agentmint credit wallet (\$10 USD)..."
-# Returns lsrq_… and an approval URL. Approve in the Link app.
+  --context "Bootstrap agentmint credit wallet (\$10 USD) for pay-as-you-go AI subagents at api.agentmint.store. Principal-bound JWT issued on settlement; agent.* calls debit this prepaid balance."
+# Response includes:
+#   - id: lsrq_…
+#   - approval_url: https://app.link.com/activity/approve/lsrq_…
+#   - status: pending_approval
+#   - _next.command: spend-request retrieve lsrq_… --interval 2 --max-attempts 300
+# Present approval_url to the user; poll status until "approved".
 
-# 3. Pay — the response includes the principal-bound access_token
+# 4. Pay — body comes back as a JSON-encoded string under .data.body
+#    when using --full-output. Parse twice to reach .result.access_token.
 link-cli mpp pay https://api.agentmint.store/a2a \
-  -X POST -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"credits.topup","params":{"amount_usd":10}}' \
-  --spend-request-id lsrq_…
+  --method POST --header 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"credits.topup","params":{"amount_usd":10}}' \
+  --spend-request-id lsrq_… \
+  --format json --full-output > /tmp/pay_resp.json
+
+JWT=$(jq -r '.data.body | fromjson | .result.access_token' /tmp/pay_resp.json)
+PRINCIPAL=$(jq -r '.data.body | fromjson | .result.principal' /tmp/pay_resp.json)
+
+# Cache for future sessions
+mkdir -p ~/.agentmint && chmod 700 ~/.agentmint
+jq -n --arg t "$JWT" --arg p "$PRINCIPAL" --arg now "$(date +%s)" \
+  '{tokens: {($p): {access_token: $t, saved_at: ($now|tonumber)}}}' \
+  > ~/.agentmint/credentials.json
+chmod 600 ~/.agentmint/credentials.json
 ```
 
 **Top up an existing wallet** (both Bearer AND rail handshake required):
 
 ```sh
 # Spend-request creation is the same; just adjust amount + context.
+# `revoke_old:true` rotates the JWT — extract the fresh one from .result.access_token.
 link-cli mpp pay https://api.agentmint.store/a2a \
-  -X POST -H 'Content-Type: application/json' \
-  -H 'X-Agentmint-Bearer: <jwt-from-previous-topup>' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"credits.topup","params":{"amount_usd":10,"revoke_old":true}}' \
-  --spend-request-id lsrq_…
+  --method POST --header 'Content-Type: application/json' \
+  --header "X-Agentmint-Bearer: $AGENTMINT_JWT" \
+  --data '{"jsonrpc":"2.0","id":1,"method":"credits.topup","params":{"amount_usd":10,"revoke_old":true}}' \
+  --spend-request-id lsrq_… \
+  --format json --full-output \
+  | jq -r '.data.body | fromjson | .result.access_token'
 ```
+
+**Cached JWT can outlive its wallet.** If `credits.balance` returns `-32004 no_account_for_principal`, the JWT is structurally valid but the server-side account was removed (e.g. wiped during a deploy). Re-bootstrap a new wallet — the old JWT cannot be reattached.
 
 After either flow, hand the returned `access_token` to the agentmint CLI to enable Bearer-authenticated agent ops:
 
