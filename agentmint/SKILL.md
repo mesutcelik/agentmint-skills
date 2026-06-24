@@ -130,15 +130,9 @@ Pass `"persona": ""` on `agent.update` to clear back to the built-in default. ME
 
 Mode is auto-detected: if you supply `api_key`, it's BYOK; otherwise all-inclusive.
 
-### Harness override (all-inclusive only)
+### Harness override (all-inclusive)
 
-Default harness for all-inclusive is `opencode` + `openrouter/fusion`. Customers can override the harness at `agent.create` with `harness: "<name>"` — the model is then locked to that harness's curated default (prevents routing to model/provider combos that lack a Stored Key):
-
-| `harness` | curated model | best for |
-|---|---|---|
-| `opencode` *(default)* | `openrouter/fusion` | Single-shot prompts; non-agentic answer-style queries |
-| `codex` | `openai/gpt-5.4` | Multi-step agentic flows (PR review, build/test loops, repo exploration). Strong instruction following. |
-| `claude-code` | `anthropic/claude-sonnet-4-6` | Code generation, refactoring, long-context analysis |
+To pick a harness other than the default, set `harness` at `agent.create`. Supported values: `opencode`, `codex`, `claude-code`. The model is selected by AgentMint to match the harness — customers cannot override the model in all-inclusive mode.
 
 ```json
 {
@@ -147,10 +141,6 @@ Default harness for all-inclusive is `opencode` + `openrouter/fusion`. Customers
 }
 ```
 
-Operator prerequisite: a corresponding Upstash "Agent API Keys" stored key must exist for the chosen harness's provider (`anthropic` for `claude-code`, `openai` for `codex`, `openrouter` for `opencode`).
-
-**Pick codex (or claude-code), not opencode, for any flow that uses more than one tool call per turn.** The `@opencode-ai/sdk` does not emit tool-completion events (see [anomalyco/opencode#31235](https://github.com/anomalyco/opencode/issues/31235)); the runner can hang ~5 minutes with empty output when the model dispatches parallel/multi-step tool calls. Single-tool prompts work cleanly. `codex` and `claude-code` runners handle tool-completion events properly. See [`pr-review` skill](https://github.com/mesutcelik/agentmint-skills/tree/main/pr-review) for a worked agentic example using `harness: codex`.
-
 ## Interview order before `agent.create`
 
 When gathering inputs from a human before provisioning, ask in this exact order — each step gates the next, so do not collect harness/model details before the human has picked a billing mode:
@@ -158,8 +148,8 @@ When gathering inputs from a human before provisioning, ask in this exact order 
 1. **Payment rail** — which rail to settle on (see "Before paying — ask the human, then verify" above). Skip only under the conditions listed there.
 2. **Billing mode** — `byok` or `all-inclusive`. This must come **before** any harness/model question, because all-inclusive needs no harness, model, or API key — asking those up front wastes the user's time and implies BYOK as the default.
 3. **Harness details** — required for `byok`, optional for `all-inclusive`:
-   - `harness` (claude-code / codex / opencode) — for all-inclusive, defaults to `opencode`; pass an override only if the customer needs `codex` (agentic) or `claude-code` (code-gen).
-   - `model` — BYOK only. In all-inclusive the model is locked to the harness's curated default; the customer cannot override.
+   - `harness` (claude-code / codex / opencode) — for all-inclusive, defaults to `opencode`; pass an override to pick a different one.
+   - `model` — BYOK only. In all-inclusive the model is selected by AgentMint; the customer cannot override.
    - `api_key` — BYOK only.
    - `runtime`, `size`, `init_command`, `skills` (optional for both).
 4. **Purpose / skills** — what the agent should do (e.g. which public GitHub skills to mount). Applies to both modes.
