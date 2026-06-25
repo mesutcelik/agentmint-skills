@@ -1,21 +1,23 @@
 ---
 name: agentmint
-description: Pay-as-you-go AI subagents over USDC or USD. Provision a persistent Claude Code / Codex / OpenCode sandbox, then send prompts and pay-per-call. Settles via x402 (Base, Solana), MPP (Tempo), or Stripe-Link (USD card via link-cli). BEFORE PAYING, run the discovery checklist below — pick the rail the user already has authenticated locally rather than defaulting to any single MCP server or chain.
+description: Pay-as-you-go AI subagents over USDC or USD. Provision a persistent Claude Code / Codex / OpenCode sandbox, then send prompts and pay from a server-side credit wallet you fund once via Stripe-Link, x402 (Base, Solana), or Tempo MPP. BEFORE PAYING, run the discovery checklist below — pick the rail the user already has authenticated locally rather than defaulting to any single MCP server or chain.
 license: MIT
 metadata:
   endpoint: https://api.agentmint.store/a2a
   agent_card: https://api.agentmint.store/.well-known/agent-card.json
   cli: https://www.npmjs.com/package/agentmint-cli
-  version: "0.5.0"
+  version: "0.6.0"
 ---
 
 # agentmint
 
-AgentMint sells **USDC-paid (or USD-via-Stripe-Link) subagents** to other AI agents.
+AgentMint sells **USDC-paid AI subagents** to other AI agents. **Unified credit-wallet model** — every customer, regardless of payment rail, follows the same flow:
 
-You pay **0.10 USDC** to provision a persistent sandbox (binding name, harness, model, optional API key, skills, init command). Each subsequent prompt costs ~0.05 USDC. State-mutation operations (update skills, cancel a run, delete the agent) cost 0.01 USDC each — the payment doubles as proof of ownership (`payer` must equal the `owner_wallet` set at create).
+1. **Bootstrap once** via `credits.topup` on your chosen rail (Stripe-Link / x402 Base / x402 Solana / Tempo MPP). Minimum $1. The response mints a Bearer JWT bound to your principal.
+2. **All subsequent calls use that JWT.** `agent.create` debits **$0.10** from the wallet. `agent.run` debits the actual provider cost + a **$0.02 platform fee** end-of-run (all-inclusive mode) or a flat **$0.02** (BYOK). State-mutation methods (`agent.update`, `cancel`, `delete`, etc.) cost $0.01 each. Lost the JWT? Recover via `credits.rekey` ($0.01 on x402/Tempo MPP rails).
+3. **One wallet per customer**, shared across every subagent that customer owns. Wallet is keyed by `principal` (`link_stripe:cus_…`, `wallet_eip155:0x…`, `wallet_solana:…`, `wallet_tempo:0x…`). Ownership of each subagent enforced by `agent.owner_principal === jwt.principal`.
 
-Blockchain customers (x402 / MPP-blockchain rails) pay each call directly from their wallet. **Stripe-Link customers** use a **caller-wide credit wallet** instead: one `credits.topup` charge funds a balance keyed to the customer's principal (`link_stripe:cus_…`); every subsequent `agent.*` call — including `agent.create` for new subagents — debits that shared balance over `Authorization: Bearer <jwt>`. One wallet per customer, used across every subagent that customer owns.
+Direct per-call payment for `agent.*` methods is **not supported** — the only methods that accept a rail-handshake without a Bearer are `credits.topup` (bootstrap / refill) and `credits.rekey` (recovery).
 
 ## Before paying — ask the human, then verify
 
@@ -52,7 +54,7 @@ env | grep -E '^(EVM|SVM|TEMPO)_PRIVATE_KEY=' \
 |-------------------|----------|----------------------------------------------|---------------------------------------------------------------|---------------------------------------------------------------------------|
 | **Stripe-Link**   | USD      | n/a (Link account + saved card)              | `link-cli auth status` AND a `type: CARD` in `payment-methods list` | User has a card, no crypto wallet; one approval per spend-request         |
 | **CLI wallet**    | USDC     | Base / Solana / Tempo (per wallet)           | See the **Wallet catalog** section — each entry has an auth-check command | A specific CLI is installed & has USDC for the relevant chain             |
-| **agentmint-cli** | USD      | n/a (Bearer JWT from `credits topup`)        | A Stripe-Link wallet token is cached locally                                | User has already bootstrapped via `agentmint credits topup`               |
+| **agentmint-cli** | USD/USDC | n/a (Bearer JWT from `credits topup`)        | A wallet token is cached at `~/.agentmint/credentials.json`                 | User has already bootstrapped via `credits.topup` on any rail             |
 | **AgentCash MCP** | USDC     | Base / Solana / Tempo                        | `mcp__agentcash__get_balance` returns ≥ $0.50                 | The MCP server is installed AND the wallet is funded; not just installed  |
 | **Raw HTTP**      | USDC/USD | any of the above                             | Custom — you're wiring x402/MPP SDKs into bespoke code        | You're building a service that pays without a CLI in the loop             |
 
@@ -62,7 +64,7 @@ The server speaks every rail at the same `/a2a` endpoint — the choice is purel
 
 - The user wants a sandboxed Claude Code / Codex / OpenCode subagent that can run shells, install packages, edit files, and persist state across calls.
 - The user wants a workflow customized via skill files (e.g. `moltycash/payment`, `your-org/your-skill`).
-- The user wants pay-as-you-go isolated compute. Pay per call from any chain, or bulk-top-up a credit wallet once via Stripe-Link / x402 and use the resulting access token for subsequent calls (no per-call signature, no monthly commitment).
+- The user wants pay-as-you-go isolated compute. Bootstrap a credit wallet once via Stripe-Link / x402 / Tempo MPP (`credits.topup`, minimum $1), then use the returned Bearer JWT for every subsequent call. No per-call signature, no monthly commitment.
 
 ## Endpoint
 
@@ -124,15 +126,22 @@ Pass `"persona": ""` on `agent.update` to clear back to the built-in default. ME
 
 ## Two billing modes (chosen at agent.create — permanent)
 
-**byok** — You configure everything: harness, model, your AI provider key. Your provider bills tokens directly. Flat **0.02 USDC** per `agent.run`.
+**byok** — You configure everything: harness, model, your AI provider key. Your provider bills tokens directly. Flat **$0.02** per `agent.run`, debited end-of-run from the credit wallet.
 
-**all-inclusive** — You configure nothing about the AI side. AgentMint picks harness + model + key. AI tokens covered. Per-call price **0.05 USDC base**, smoothed 0.01 ↔ 0.075 across recent runs based on actual token cost.
+**all-inclusive** — You configure nothing about the AI side. AgentMint picks harness + model + the operator's stored provider key. AI tokens covered. End-of-run debit of **`actual_provider_cost + $0.02 platform fee`** from the credit wallet. The provider cost is computed from token counts × calibrated per-model rates (cache-aware — runs where the provider's prompt cache hits are billed correctly). Every `agent.run` response carries the breakdown:
+
+```json
+"billed_usdc":        0.103363,
+"provider_cost_usdc": 0.083363,
+"platform_fee_usdc":  0.020000,
+"actual_cost_usd":    0.083363
+```
 
 Mode is auto-detected: if you supply `api_key`, it's BYOK; otherwise all-inclusive.
 
 ### Harness override (all-inclusive)
 
-To pick a harness other than the default, set `harness` at `agent.create`. Supported values: `opencode`, `codex`, `claude-code`. The model is selected by AgentMint to match the harness — customers cannot override the model in all-inclusive mode.
+Default is `codex` + `openai/gpt-5.4`. To pick a different harness, set `harness` at `agent.create`. Supported values: `codex`, `claude-code`, `opencode`. The model is auto-selected from the harness's curated default (`anthropic/claude-sonnet-4-6` for claude-code, `openrouter/fusion` for opencode); customers cannot override the model in all-inclusive mode. Each value requires the operator to have a matching stored provider key in the Upstash Box dashboard.
 
 ```json
 {
@@ -157,53 +166,77 @@ When gathering inputs from a human before provisioning, ask in this exact order 
 
 ## Methods
 
+Every `agent.*` method requires `Authorization: Bearer <jwt>`. Bootstrap the JWT via `credits.topup`. Calls without Bearer return `401 bearer_required` with a hint pointing at `credits.topup`.
+
 | Method | Cost | Auth | Purpose |
 |--------|------|------|---------|
-| `agent.create` | 0.10 USDC | blockchain: per-call rail handshake. Stripe-Link: Bearer (debits the caller-wide wallet — bootstrap with `credits.topup` first) | Provision a persistent named subagent; owner = payer/principal |
-| `agent.run`    | 0.02 / 0.05 USDC | payer / principal = owner | Send a prompt; receive reply |
-| `agent.update` | 0.01 USDC | payer / principal = owner | Update skills, init command, model |
-| `agent.cancel` | 0.01 USDC | payer / principal = owner | Cancel a stuck run |
-| `agent.runs`   | 0.01 USDC | payer / principal = owner | List recent runs |
-| `agent.get`    | 0.01 USDC | payer / principal = owner | Read agent metadata |
-| `agent.delete` | 0.01 USDC | payer / principal = owner | Destroy the subagent |
-| `agent.list`   | 0.01 USDC | payer / principal = owner | Enumerate all subagents owned by the caller (`limit` default 50, max 200; `offset` for paging) |
-| `credits.topup` | ≥ $10 USD | **Stripe-MPP only**. No Bearer = bootstrap (mints JWT). With Bearer = top up existing wallet | Fund the caller-wide credit wallet; response includes the (fresh) access token |
-| `credits.balance` | free | `Authorization: Bearer <jwt>` | Read caller-wide balance |
-| `credits.revoke_token` | free | `Authorization: Bearer <jwt>` | Revoke a specific jti for the caller |
-| `credits.history` | free | `Authorization: Bearer <jwt>` | Per-event ledger: every topup, debit, refund for the caller |
+| `agent.create` | $0.10 | Bearer | Provision a persistent named subagent; owner = principal |
+| `agent.run`    | end-of-run debit: `$0.02` (BYOK) or `actual_cost + $0.02` (all-inclusive) | Bearer | Send a prompt; receive reply |
+| `agent.update` | $0.01 | Bearer | Update skills, init command, model |
+| `agent.cancel` | $0.01 | Bearer | Cancel a stuck run |
+| `agent.runs`   | $0.01 | Bearer | List recent runs |
+| `agent.get`    | $0.01 | Bearer | Read agent metadata |
+| `agent.delete` | $0.01 | Bearer | Destroy the subagent |
+| `agent.list`   | $0.01 | Bearer | Enumerate all subagents owned by the caller (`limit` default 50, max 200; `offset` for paging) |
+| `credits.topup` | ≥ $1 USD | **Any rail** (Stripe-MPP / x402 Base / x402 Solana / Tempo MPP). No Bearer = bootstrap (mints JWT). With Bearer = top up existing wallet | Fund the caller-wide credit wallet; response includes the (fresh) access token |
+| `credits.rekey` | $0.01 USD | **x402 / Tempo MPP only**. No Bearer (whole point — customer lost their JWT) | Re-mint a Bearer JWT for an existing wallet using signed micropayment as wallet-ownership proof. Stripe-rail rekey is a separate (deferred) design. |
+| `credits.balance` | free | Bearer | Read caller-wide balance |
+| `credits.revoke_token` | free | Bearer | Revoke a specific jti for the caller |
+| `credits.history` | free | Bearer | Per-event ledger: every topup, debit, refund, rekey for the caller |
 
+**Stripe-Link fee passthrough**: a $X Stripe-rail topup costs the customer roughly `(X + 0.30) / (1 - 0.029) ≈ X + 5.9%` because Stripe's 2.9% + $0.30 fee is passed through. The wallet is credited with the requested `amount_usd`; the customer's Stripe statement matches the higher charge. x402 and Tempo MPP settle 1:1 — no fee passthrough (on-chain settlement fees are negligible and paid by the signer).
 
-Use this when you want one-shot delegated work in an isolated cloud sandbox. For a persistent specialist that remembers across calls, use `agent.create` + `agent.run` instead.
+**Concurrency gate (Bearer)**: when the credit-wallet balance is under **$1**, only ONE `agent.run` can be in-flight at a time per principal. At ≥ $1, up to 5 concurrent runs are allowed. Crossing the threshold also fires a `_credits.low_balance_warning` field on every response. Topup to clear it.
 
-## Caller-wide credit wallet (Stripe-Link only)
+## Caller-wide credit wallet (every rail)
 
-The credit-wallet flow is **only available on the Stripe-Link rail**. Blockchain customers (Base / Solana / Tempo) already have on-chain balances and pay per call from those. Stripe-Link customers, with no on-chain wallet, instead get a **caller-wide credit balance** funded by Stripe-MPP top-ups — bulk pre-payment avoids Stripe's ~$0.30 + 2.9% per-call fees that would otherwise dwarf the cost of each method.
+Every customer uses the same credit-wallet model — there is no longer a per-call settlement path for `agent.*`. Bootstrap once via `credits.topup` on your chosen rail, then every subsequent call debits from the wallet over Bearer.
 
-**The credit ledger is keyed by `principal` (e.g. `link_stripe:cus_…`), not by `agent_id`.** A customer with N subagents has ONE shared balance and ONE JWT that authorises any `agent.*` call against any of those subagents. Ownership is enforced by `agent.owner_principal === jwt.principal`.
+**The credit ledger is keyed by `principal`, not by `agent_id`.** Principal namespace per rail:
 
-**Stripe-MPP rail accepts only `credits.topup`.** Every other method over Stripe-MPP returns `400 use_bearer_after_topup` — call via `Authorization: Bearer <access_token>` instead. Blockchain rails reject `credits.*` entirely with `400 stripe_rail_required`.
+| Rail | Principal example |
+|---|---|
+| Stripe-Link | `link_stripe:cus_…` |
+| x402 Base | `wallet_eip155:0x…` |
+| x402 Solana | `wallet_solana:…` |
+| Tempo MPP | `wallet_tempo:0x…` (or rail-specific form returned by `principalFromMppBlockchain`) |
 
-Principal format on this rail: `link_stripe:cus_…` (stored as `agent.owner_principal` on every subagent and as the wallet key on Redis).
+A customer with N subagents has ONE shared balance and ONE active JWT (per the most recent topup / rekey) that authorises any `agent.*` call against any of those subagents. Ownership is enforced by `agent.owner_principal === jwt.principal`.
 
 Flow:
 
-1. **Bootstrap the wallet.** Call `credits.topup` over Stripe-MPP with **no Bearer** and `{ amount_usd }` (≥ $10). Server creates `account:<principal>`, credits the paid amount, and returns `{ principal, balance_microusdc, balance_usd, access_token, bootstrap: true }`. The JWT is bound to the principal (not to any specific agent) and has no expiry.
-2. **Mint subagents.** Call `agent.create` with `Authorization: Bearer <jwt>` and `{ name, ...optional }`. Server debits 0.10 USDC equivalent from the wallet and provisions the subagent.
-3. **Run / update / delete.** Every other `agent.*` call sends `Authorization: Bearer <jwt>`. The handler resolves the target subagent by `agent_id` or `name`, verifies `agent.owner_principal === jwt.principal`, and debits the operation's price (0.02 BYOK run / smoothed all-inclusive / 0.01 dust). No Stripe round-trip per call.
-4. **Top up.** Call `credits.topup` with `{ amount_usd }`, Stripe-MPP handshake on `Authorization`, AND `X-Agentmint-Bearer: <jwt>` for the existing token. Server credits the wallet and mints a fresh JWT. Pass `{ revoke_old: true }` to invalidate the prior jti in the same call.
-5. **Insufficient credits.** Server returns `402` with `error.data.required_microusdc` and `error.data.available_microusdc` plus a top-up challenge. Top up and retry.
-6. **Rotate a token.** Every `credits.topup` mints a fresh access token (and revokes the prior jti if `revoke_old: true`). To revoke a specific stale jti out-of-band, call `credits.revoke_token --jti <old_jti>` with any working token for the same principal.
+1. **Bootstrap the wallet.** Call `credits.topup` over your chosen rail with **no Bearer** and `{ amount_usd }` (≥ $1). Server creates `account:<principal>`, credits the paid amount, and returns `{ principal, balance_microusdc, balance_usd, access_token, bootstrap: true }`. The JWT is bound to the principal (not to any specific agent) and has no expiry. **On the Stripe-Link rail, the customer's actual Stripe charge is `~(amount_usd + 0.30) / 0.971`** because Stripe's processing fee is passed through; wallet is credited the requested `amount_usd`.
+2. **Mint subagents.** Call `agent.create` with `Authorization: Bearer <jwt>` and `{ name, ...optional }`. Server debits $0.10 from the wallet and provisions the subagent.
+3. **Run / update / delete.** Every other `agent.*` call sends `Authorization: Bearer <jwt>`. The handler resolves the target subagent by `agent_id` or `name`, verifies `agent.owner_principal === jwt.principal`, and debits the operation's price (end-of-run for `agent.run`; $0.01 dust for the rest). No rail round-trip per call.
+4. **Top up.** Call `credits.topup` with `{ amount_usd }`, the rail's signature on `Authorization`, AND `X-Agentmint-Bearer: <jwt>` for the existing token (if you have one). Server credits the wallet and mints a fresh JWT. Pass `{ revoke_old: true }` to invalidate the prior jti in the same call.
+5. **Insufficient credits.** `agent.run` returns 402 with `error.data.required_microusdc` and `available_microusdc` if the upfront minimum-balance gate fails. Otherwise, end-of-run shortfalls suspend the account; `agent.run` returns the result but `_credits.debited_microusdc` is 0 and the account is no longer usable until topup + manual operator review.
+6. **Recover a lost JWT.** Call `credits.rekey` over x402 (Base/Solana) or Tempo MPP. Customer signs $0.01 USDC; signature recovers the wallet address; server mints a fresh JWT bound to the same principal (and revokes the prior jti by default). Stripe-rail rekey is deferred — for now, Stripe customers recover by calling `credits.topup` again. Rate-limited to 3 rekeys per principal per hour.
+7. **Rotate a token.** Every `credits.topup` (and `credits.rekey`) mints a fresh access token. To revoke a specific stale jti out-of-band, call `credits.revoke_token --jti <old_jti>` with any working token for the same principal.
 
-Every credit-paid response carries an inline `_credits` block so clients see balance drift without an extra round-trip:
+Every Bearer-authenticated response carries an inline `_credits` block so clients see balance drift without an extra round-trip:
 
 ```json
 {
   "result": { ... },
   "_credits": {
-    "debited_microusdc": 2000,
-    "balance_microusdc_after": 998000,
-    "principal": "link_stripe:cus_…"
+    "debited_microusdc": 103363,
+    "debited_usd": "0.10",
+    "balance_microusdc_before": 6765887,
+    "balance_microusdc_after":  6662524,
+    "balance_usd_after": "6.66",
+    "principal": "link_stripe:cus_…",
+    "low_balance_warning": null
   }
+}
+```
+
+When balance < $1, `low_balance_warning` is populated:
+
+```json
+"low_balance_warning": {
+  "threshold_usdc": 1,
+  "balance_usd": "0.50",
+  "hint": "Topup credits to $1+ to enable concurrent agent.run calls. Until then, only one run at a time is allowed."
 }
 ```
 
@@ -320,14 +353,15 @@ agentmint agent create --name reviewer-myrepo  # debits 0.10 USDC from the walle
 agentmint agent run --name reviewer-myrepo "..."   # debits per-call from the same wallet
 ```
 
-### Blockchain-rail CLI
+### agentmint CLI (any rail, post-bootstrap)
 
-For the Stripe-Link rail, the agentmint CLI handles everything via the cached wallet token (bootstrap once via `credits topup`):
+Once you have a Bearer JWT (from `credits.topup` on any rail), the agentmint CLI handles every `agent.*` operation against the cached token. The CLI itself doesn't sign on-chain payments — for those use the rail-specific tools below (link-cli, tempo-request, agentcash).
 
 ```sh
-agentmint agent create --name foo --network base     # pay 0.10 USDC on-chain
-agentmint agent run --name foo "..."                 # pay per call
-agentmint credits balance                            # only meaningful for Stripe-Link wallets
+agentmint credits set-token <jwt>                    # cache JWT issued by your bootstrap rail
+agentmint agent create --name foo                    # debits $0.10 from the wallet
+agentmint agent run --name foo "..."                 # debits actual_cost + $0.02 fee end-of-run
+agentmint credits balance                            # works for any principal namespace
 agentmint credits revoke-token --jti …               # revoke a specific JWT
 agentmint credits logout                             # forget the cached wallet token
 ```
@@ -345,13 +379,15 @@ Third-party CLI binaries that wrap the x402/MPP handshake. (For the Stripe-Link 
 - **Auth check**: `npx agentcash@latest accounts`
 - **USDC balance**: `npx agentcash@latest balance`
 - **Transport**: `npx agentcash@latest fetch <url> -m POST -b '<json>' --payment-network <base|solana|tempo>`
-- **Example**:
+- **Bootstrap a credit wallet** (one-time):
   ```bash
   npx agentcash@latest fetch https://api.agentmint.store/a2a \
     -m POST \
-    -b '{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"harness":"claude-code","model":"anthropic/claude-haiku-4-5","runtime":"node","size":"small"}}' \
+    -b '{"jsonrpc":"2.0","id":1,"method":"credits.topup","params":{"amount_usd":5}}' \
     --payment-network tempo
+  # → response.result.access_token  ← cache this JWT, use for every agent.* call below
   ```
+- **After bootstrap**: use the Bearer JWT with the agentmint CLI or raw HTTP. Direct `agent.create` over agentcash is no longer accepted (returns 401 `bearer_required`).
 - **Notes**: `--payment-network` flag is required — picks x402 vs MPP.
 
 ### tempo — MPP on Tempo
@@ -360,12 +396,14 @@ Third-party CLI binaries that wrap the x402/MPP handshake. (For the Stripe-Link 
 - **Install**: Tempo CLI from [docs.tempo.xyz/cli](https://docs.tempo.xyz/cli); then `tempo add request`.
 - **Auth check** (also shows USDC balance): `tempo wallet whoami`
 - **Transport**: `tempo request -X POST --json '<json>' <url>`
-- **Example**:
+- **Bootstrap a credit wallet** (one-time):
   ```bash
   tempo request -X POST \
-    --json '{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"harness":"claude-code","model":"anthropic/claude-haiku-4-5","runtime":"node","size":"small"}}' \
+    --json '{"jsonrpc":"2.0","id":1,"method":"credits.topup","params":{"amount_usd":5}}' \
     https://api.agentmint.store/a2a
+  # → response.result.access_token  ← cache this JWT for every agent.* call below
   ```
+- **After bootstrap**: use the Bearer JWT with the agentmint CLI or raw HTTP. Direct `agent.create` over `tempo request` is no longer accepted (returns 401 `bearer_required`).
 
 ---
 
@@ -400,17 +438,23 @@ Response (BYOK):
   "result": {
     "agent_id": "agt_a1b2c3d4e5f6",
     "owner_wallet": "0x...",
+    "owner_principal": "wallet_eip155:0x...",
     "mode": "byok",
     "harness": "claude-code",
     "model": "anthropic/claude-haiku-4-5",
-    "run_price_usdc": 0.02,
-    "skills": ["moltycash/payment"],
-    "transaction": { "hash": "0x...", "network": "base" }
+    "skills": ["moltycash/payment"]
+  },
+  "_credits": {
+    "debited_microusdc": 100000,
+    "balance_microusdc_after": 9900000,
+    "balance_usd_after": "9.90",
+    "principal": "wallet_eip155:0x...",
+    "low_balance_warning": null
   }
 }
 ```
 
-Save the `agent_id` — you need it for every subsequent call. The harness/model are not echoed in all-inclusive responses.
+Save the `agent_id` — you need it for every subsequent call. The harness/model are not echoed in all-inclusive responses. No `run_price_usdc` field: per-call price is variable for all-inclusive (end-of-run debit of actual cost + platform fee).
 
 ## agent.run
 
@@ -452,22 +496,36 @@ Save the `agent_id` — you need it for every subsequent call. The harness/model
 }
 ```
 
-Response:
+Response (all-inclusive, with end-of-run debit breakdown):
 
 ```json
 {
   "jsonrpc": "2.0", "id": 1,
   "result": {
-    "run_id": "run_...",
-    "output": "...",
-    "billed_usdc": 0.05,
-    "actual_cost_usd": 0.0083,                              // token-rate estimate
-    "balance_usdc": 0.0417,                                 // smoothing balance
-    "duration_ms": 4321,
-    "transaction": { "hash": "0x...", "network": "base" }
+    "agent_id":           "agt_...",
+    "run_id":             "run_...",
+    "output":             "...",
+    "mode":               "all-inclusive",
+    "billed_usdc":        0.103363,        // what the wallet was debited
+    "provider_cost_usdc": 0.083363,        // actual provider cost (cache-aware)
+    "platform_fee_usdc":  0.020000,        // operator margin
+    "actual_cost_usd":    0.083363,        // raw provider cost (back-compat alias)
+    "duration_ms":        24080
+  },
+  "_credits": {
+    "debited_microusdc":         103363,
+    "balance_microusdc_before":  6765887,
+    "balance_microusdc_after":   6662524,
+    "balance_usd_after":         "6.66",
+    "principal":                 "link_stripe:cus_...",
+    "low_balance_warning":       null
   }
 }
 ```
+
+For BYOK: `billed_usdc` is always `0.02`, `provider_cost_usdc` and `actual_cost_usd` are `null` (the customer's AI provider key paid for tokens directly; AgentMint never sees the cost).
+
+For async (`async: true`): the immediate response returns `{ run_id, status: "dispatched", billed_usdc: 0, billing_pending: true }`. Final billing happens when the box reports completion — the customer's webhook payload (and `agent.run.status` / `agent.runs`) carry the final `billed_usdc` and `_credits` block.
 
 The sandbox filesystem persists across calls. The subagent hibernates between runs at no cost.
 
@@ -533,7 +591,7 @@ npx -y agentmint-cli@latest agent cancel          # kill a stuck run
 npx -y agentmint-cli@latest agent delete          # tear down
 ```
 
-Output is clean human text on stdout; add `--json` for raw JSON-RPC results, `--verbose` to see Bearer chatter on stderr. The CLI is Stripe-Link only; blockchain customers pay via curl / agentcash / tempo directly to `/a2a`.
+Output is clean human text on stdout; add `--json` for raw JSON-RPC results, `--verbose` to see Bearer chatter on stderr. The CLI itself only speaks Bearer; for the initial `credits.topup` bootstrap use the rail-specific signer (link-cli for Stripe, tempo-request for Tempo, agentcash for x402). After bootstrap, all `agent.*` operations go through this CLI regardless of which rail funded the wallet.
 
 Cache lives at `~/.agentmint/agents.json`; override per-call with `AGENTMINT_AGENT_ID=agt_… npx agentmint-cli agent run "…"`.
 
@@ -542,19 +600,28 @@ For full CLI reference: <https://github.com/mesutcelik/agentmint-cli-repository>
 ### x402 over Base (curl, EVM)
 
 ```bash
-# 1. Get the 402 challenge
+# 1. Bootstrap your credit wallet — sign $5 USDC on Base via x402.
+#    Get the 402 challenge first:
 curl -X POST https://api.agentmint.store/a2a \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"mode":"all-inclusive"}}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"credits.topup","params":{"amount_usd":5}}'
 
 # Response → 402 with accepts[] including a `network: "eip155:8453"` entry.
-# Sign that entry's payload with your EVM wallet via @x402/core + @x402/evm.
+# Sign that entry's payload with your EVM wallet via @x402/core + @x402/evm,
+# then resubmit with PAYMENT-SIGNATURE header.
 
-# 2. Resubmit with the signed header
 curl -X POST https://api.agentmint.store/a2a \
   -H "Content-Type: application/json" \
   -H "PAYMENT-SIGNATURE: <base64-payload>" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"mode":"all-inclusive"}}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"credits.topup","params":{"amount_usd":5}}'
+
+# Response includes result.access_token — cache it.
+
+# 2. All subsequent agent.* calls use the JWT (no x402 signing needed).
+curl -X POST https://api.agentmint.store/a2a \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <jwt>" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"mode":"all-inclusive","name":"foo"}}'
 ```
 
 ### x402 over Base (TypeScript / `@x402/evm`)
@@ -575,17 +642,22 @@ registerExactEvmScheme(client, {
     reqs.find(r => r.network === "eip155:8453") || reqs[0],
 });
 
-const body = { jsonrpc: "2.0", id: 1, method: "agent.create",
-               params: { mode: "all-inclusive" } };
-
-const phase1 = await axios.post(URL, body, { validateStatus: () => true });
+// 1. Bootstrap credit wallet (x402 signed payment).
+const topupBody = { jsonrpc: "2.0", id: 1, method: "credits.topup",
+                    params: { amount_usd: 5 } };
+const phase1 = await axios.post(URL, topupBody, { validateStatus: () => true });
 const payload = await client.createPaymentPayload(phase1.data);
-const header = encodePaymentSignatureHeader(payload);
+const phase2 = await axios.post(URL, topupBody,
+  { headers: { "PAYMENT-SIGNATURE": encodePaymentSignatureHeader(payload) } });
 
-const phase2 = await axios.post(URL, body,
-  { headers: { "PAYMENT-SIGNATURE": header } });
+const jwt = phase2.data.result.access_token;   // cache this
 
-console.log(phase2.data.result.agent_id);
+// 2. Subsequent calls use Bearer.
+const createBody = { jsonrpc: "2.0", id: 2, method: "agent.create",
+                     params: { mode: "all-inclusive", name: "foo" } };
+const created = await axios.post(URL, createBody,
+  { headers: { "Authorization": `Bearer ${jwt}` } });
+console.log(created.data.result.agent_id);
 ```
 
 ### x402 over Solana (`@x402/svm`)
@@ -602,7 +674,8 @@ registerExactSvmScheme(client, {
   paymentRequirementsSelector: (_v, reqs) =>
     reqs.find(r => (r.network as string).startsWith("solana:")) || reqs[0],
 });
-// Same two-phase flow as Base.
+// Same two-phase bootstrap flow as Base: sign credits.topup with x402,
+// extract result.access_token, then use Bearer for every agent.* call.
 ```
 
 ### MPP over Tempo (`mppx`)
@@ -614,12 +687,22 @@ import { privateKeyToAccount } from "viem/accounts";
 const account = privateKeyToAccount(process.env.TEMPO_PRIVATE_KEY as `0x${string}`);
 const client = Mppx.create({ methods: [tempo.charge({ signer: account })] });
 
-// Single call — the client auto-handles the 402, signs, and retries.
-const res = await client.fetch("https://api.agentmint.store/a2a", {
+// 1. Bootstrap: client auto-handles the 402, signs, and retries.
+const topup = await client.fetch("https://api.agentmint.store/a2a", {
   method: "POST",
   headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "agent.create",
-                         params: { mode: "all-inclusive" } }),
+  body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "credits.topup",
+                         params: { amount_usd: 5 } }),
+});
+const jwt = (await topup.json()).result.access_token;
+
+// 2. Subsequent agent.* calls use the JWT directly (no client.fetch — Tempo
+// signing is no longer needed once the wallet is funded).
+await fetch("https://api.agentmint.store/a2a", {
+  method: "POST",
+  headers: { "Content-Type": "application/json", "Authorization": `Bearer ${jwt}` },
+  body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "agent.create",
+                         params: { mode: "all-inclusive", name: "foo" } }),
 });
 ```
 
