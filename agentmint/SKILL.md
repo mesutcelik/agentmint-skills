@@ -208,7 +208,7 @@ Flow:
 1. **Bootstrap the wallet.** Call `credits.topup` over your chosen rail with **no Bearer** and `{ amount_usd }` (≥ $1). Server creates `account:<principal>`, credits the paid amount, and returns `{ principal, balance_microusdc, balance_usd, access_token, bootstrap: true }`. The JWT is bound to the principal (not to any specific agent) and has no expiry. **On the Stripe-Link rail, the customer's actual Stripe charge is `~(amount_usd + 0.30) / 0.971`** because Stripe's processing fee is passed through; wallet is credited the requested `amount_usd`.
 2. **Mint subagents.** Call `agent.create` with `Authorization: Bearer <jwt>` and `{ name, ...optional }`. Server debits $0.10 from the wallet and provisions the subagent.
 3. **Run / update / delete.** Every other `agent.*` call sends `Authorization: Bearer <jwt>`. The handler resolves the target subagent by `agent_id` or `name`, verifies `agent.owner_principal === jwt.principal`, and debits the operation's price (end-of-run for `agent.run`; $0.01 dust for the rest). No rail round-trip per call.
-4. **Top up.** Call `credits.topup` with `{ amount_usd }`, the rail's signature on `Authorization`, AND `X-Agentmint-Bearer: <jwt>` for the existing token (if you have one). Server credits the wallet and mints a fresh JWT. Pass `{ revoke_old: true }` to invalidate the prior jti in the same call.
+4. **Top up.** Call `credits.topup` with `{ amount_usd }` and the rail's signature on `Authorization`. The rail signature identifies the payer (Stripe customer / x402 signer / Tempo MPP payer), so no Bearer is needed — the server derives the destination principal from the signature and credits the existing wallet (or creates one if this is the first call). Server mints a fresh JWT on every topup. Pass `{ revoke_old: true }` to invalidate the canonical jti currently on record.
 5. **Insufficient credits.** `agent.run` returns 402 with `error.data.required_microusdc` and `available_microusdc` if the upfront minimum-balance gate fails. Otherwise, end-of-run shortfalls suspend the account; `agent.run` returns the result but `_credits.debited_microusdc` is 0 and the account is no longer usable until topup + manual operator review.
 6. **Recover a lost JWT.** Call `credits.rekey` over x402 (Base/Solana) or Tempo MPP. Customer signs $0.01 USDC; signature recovers the wallet address; server mints a fresh JWT bound to the same principal (and revokes the prior jti by default). Stripe-rail rekey is deferred — for now, Stripe customers recover by calling `credits.topup` again. Rate-limited to 3 rekeys per principal per hour.
 7. **Rotate a token.** Every `credits.topup` (and `credits.rekey`) mints a fresh access token. To revoke a specific stale jti out-of-band, call `credits.revoke_token --jti <old_jti>` with any working token for the same principal.
@@ -329,14 +329,15 @@ jq -n --arg t "$JWT" --arg p "$PRINCIPAL" --arg now "$(date +%s)" \
 chmod 600 ~/.agentmint/credentials.json
 ```
 
-**Top up an existing wallet** (both Bearer AND rail handshake required):
+**Top up an existing wallet** (same flow as bootstrap — rail signature alone, no JWT header needed):
 
 ```sh
 # Spend-request creation is the same; just adjust amount + context.
 # `revoke_old:true` rotates the JWT — extract the fresh one from .result.access_token.
+# The rail signature identifies the Stripe customer, so the same wallet
+# gets credited automatically; no need to also send the existing JWT.
 link-cli mpp pay https://api.agentmint.store/a2a \
   --method POST --header 'Content-Type: application/json' \
-  --header "X-Agentmint-Bearer: $AGENTMINT_JWT" \
   --data '{"jsonrpc":"2.0","id":1,"method":"credits.topup","params":{"amount_usd":10,"revoke_old":true}}' \
   --spend-request-id lsrq_… \
   --format json --full-output \
