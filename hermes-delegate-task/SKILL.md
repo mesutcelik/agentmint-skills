@@ -1,7 +1,7 @@
 ---
 name: hermes-delegate-task
-description: Route Hermes `delegate_task(background=True)` to named, persistent AgentMint subagents — specialists that accumulate `/workspace/MEMORY.md` across calls. Catch-all default via `default_agent_name="general-worker"`; per-call specialist routing via an `agentmint-<name>` entry in `toolsets`. Polling delivery (no public HTTPS endpoint required); pay via any rail (Stripe-Link / x402 / Tempo MPP).
-version: 0.9.1
+description: Route Hermes `delegate_task(background=True)` to named, persistent AgentMint subagents — specialists that accumulate `/workspace/MEMORY.md` across calls. After `pip install agentmint-hermes-runner` and a one-time `agentmint-hermes-init`, the adapter auto-wires at every Hermes boot. Catch-all default via `general-worker`; per-call specialist routing via `toolsets=["agentmint-<name>"]`.
+version: 0.10.0
 author: AgentMint
 license: MIT
 platforms: [linux, macos]
@@ -17,9 +17,9 @@ Bridges Hermes' `delegate_task(background=True)` to **named, persistent AgentMin
 
 ## When to use
 
-- Hermes' session needs a **specialist** (PR reviewer, compliance checker, customer-support agent, codebase oracle, ...) that accumulates domain knowledge across days/weeks → pre-mint a named specialist and route per-call.
-- A task fans out into N independent slices and each should land in its own named specialist → pre-mint per slice; LLM addresses each by name.
-- You want **`delegate_task(background=True)`** to dispatch the actual work to an isolated sandbox with its own MEMORY, not into the Hermes gateway itself.
+- Hermes' session needs **specialists** that accumulate domain knowledge across days/weeks (code reviewer, data analyst, support agent, codebase oracle, ...) → pre-mint per specialist, the LLM addresses each by name.
+- You want `delegate_task(background=True)` to dispatch the actual work to an isolated sandbox with its own MEMORY, not into the Hermes gateway itself.
+- You want predictable per-call cost (BYOK $0.02 flat or all-inclusive actual-cost + $0.02 platform fee) from a server-side credit wallet you fund once via any rail.
 
 Not the right tool when:
 
@@ -28,215 +28,92 @@ Not the right tool when:
 
 ## Routing model
 
-Exactly two surfaces. Don't conflate them.
+Two surfaces, never conflated.
 
 | Surface | Role |
 |---|---|
-| **`default_agent_name="general-worker"`** | Catch-all for unrouted delegations. Use only for a **generic** worker; the default's job is "send any background offload here, accumulate the session breadcrumb." |
-| **`toolsets=["agentmint-<name>"]`** | Per-call specialist routing. LLM includes this in the toolsets list to send a particular call to a particular expert (e.g. `agentmint-pr-reviewer`). Each specialist has its own MEMORY.md. |
+| **`default_agent_name="general-worker"`** | Catch-all for unrouted delegations. The default is a **generic** worker — its job is "send any background offload here, accumulate the session breadcrumb." |
+| **`toolsets=["agentmint-<name>"]`** | Per-call specialist routing. The LLM includes this in the toolsets list to send a particular call to a particular pre-minted expert. Each specialist has its own MEMORY.md. |
 
 **Pattern discipline:** never name a specialist as `default_agent_name`. Specialists go through the toolsets directive; the default slot is generic. Naming a specialist as the default breaks the moment you add a second specialist.
 
-## Operator setup (5 steps)
-
-### Step 1 — bootstrap an AgentMint credit wallet (one-time, $1 minimum)
-
-Any rail works. Pick whichever the operator has authenticated locally:
+## Operator setup
 
 ```bash
-# Stripe-Link via link-cli:
-link-cli mpp pay https://api.agentmint.store/a2a -X POST \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"credits.topup","params":{"amount_usd":5}}'
+# 1. Install the runner inside Hermes' Python environment
+pip install agentmint-hermes-runner
 
-# x402 Base via agentcash:
-npx agentcash@latest fetch https://api.agentmint.store/a2a \
-  -m POST -b '{"jsonrpc":"2.0","id":1,"method":"credits.topup","params":{"amount_usd":5}}' \
-  --payment-network base
+# 2. One-time bootstrap — interactive
+agentmint-hermes-init
+#    → picks a payment rail (link-cli / tempo-request / agentcash)
+#    → tops up ≥ $1 (default $5)
+#    → caches JWT to ~/.agentmint/credentials.json
+#    → mints `general-worker` (the catch-all)
 
-# Tempo MPP via tempo-request:
-~/.tempo/bin/tempo-request -X POST -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"credits.topup","params":{"amount_usd":5}}' \
-  https://api.agentmint.store/a2a
+# 3. Restart Hermes
+#    The runner's `hermes_agent.plugins` entry-point fires at boot,
+#    reads the cached JWT, and auto-wires `delegate_task`. No edits to
+#    Hermes' startup script needed.
 ```
 
-Extract `result.access_token` from the response. Cache it:
-
-```bash
-export AGENTMINT_JWT=<the access_token>
-mkdir -p ~/.agentmint && chmod 700 ~/.agentmint
-echo "$AGENTMINT_JWT" > ~/.agentmint/jwt
-chmod 600 ~/.agentmint/jwt
-```
-
-### Step 2 — install the runner
-
-```bash
-pip install agentmint-hermes-runner   # in Hermes' venv
-```
-
-### Step 3 — pre-mint a generic worker (catch-all)
-
-```bash
-curl -X POST https://api.agentmint.store/a2a \
-  -H "Authorization: Bearer $AGENTMINT_JWT" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "jsonrpc":"2.0","id":1,"method":"agent.create",
-    "params":{
-      "name":"general-worker",
-      "mode":"all-inclusive",
-      "persona":"General-purpose worker. Handle whatever delegation you receive. Append a 1-2 sentence summary to /workspace/MEMORY.md after each meaningful run."
-    }
-  }' | jq '.result.agent_id'
-```
-
-Cost: $0.10 from your credit wallet.
-
-### Step 4 — wire the adapter into Hermes startup
-
-Add to your Hermes gateway startup code (the script that boots the gateway), **before** any `delegate_task` call:
-
-```python
-import os
-from agentmint_hermes_runner import (
-    AgentMintDispatcher, BearerAuth, install_delegate_task_wrapper,
-)
-
-dispatcher = AgentMintDispatcher(auth=BearerAuth(jwt=os.environ["AGENTMINT_JWT"]))
-install_delegate_task_wrapper(dispatcher, default_agent_name="general-worker")
-```
-
-Restart Hermes so the new module loads and the patch takes effect.
-
-### Step 5 — verify
-
-In a Hermes chat:
+After step 3, from Hermes:
 
 ```
-> Use delegate_task with background=True: "Say hello and tell me what you remember."
+> delegate this in the background via delegate_task:
+  "say hello and tell me what you remember."
 ```
 
 You should see the call dispatched to `general-worker`, polled until done, then re-injected as a new Hermes turn.
 
-## PR review quickstart (the canonical demo)
+## Adding specialists
 
-Once steps 1-4 above are done, add the `pr-reviewer` specialist on top of the generic catch-all.
-
-### Pre-mint the specialist
+Specialists are pre-minted **separately** — not by `agentmint-hermes-init`. Use `curl` (or the agentmint CLI) per specialist:
 
 ```bash
+JWT=$(jq -r '.tokens | to_entries[0].value.access_token' ~/.agentmint/credentials.json)
+
 curl -X POST https://api.agentmint.store/a2a \
-  -H "Authorization: Bearer $AGENTMINT_JWT" \
+  -H "Authorization: Bearer $JWT" \
   -H 'Content-Type: application/json' \
-  -d '{
-    "jsonrpc":"2.0","id":1,"method":"agent.create",
-    "params":{
-      "name":"pr-reviewer",
-      "mode":"all-inclusive",
-      "persona":"You review GitHub PRs. Follow the pr-review skill exactly.",
-      "skills":["mesutcelik/agentmint-skills/pr-review"]
-    }
-  }' | jq '.result.agent_id'
+  -d '{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{
+    "name":"<specialist-name>",
+    "mode":"all-inclusive",
+    "persona":"<what this specialist does>",
+    "skills":["<optional GitHub skills>"]
+  }}'
 ```
 
-Cost: another $0.10 from your wallet. The `mesutcelik/agentmint-skills/pr-review` skill ships the `fetch.sh` and `post.sh` scripts into `/workspace/home/pr-review/` inside the box.
+Cost: $0.10 per specialist mint. After it exists, the Hermes LLM addresses it by including `agentmint-<specialist-name>` in `toolsets`. The LLM only knows about specialists you tell it about — list them in the Hermes session persona.
 
-### Tell Hermes' LLM the specialist exists
+## How the Hermes LLM uses this
 
-Add to your Hermes session persona (system prompt):
+After the operator setup above, the LLM has two patterns at its disposal:
 
-```
-You have one background specialist available via delegate_task:
+**Pattern A — unrouted (lands in `general-worker`):**
 
-  - pr-reviewer — reviews GitHub PRs in any owner/repo. Use this for any
-    "review PR X" request. To dispatch to it, include "agentmint-pr-reviewer"
-    in the toolsets list AND ship the GitHub PAT via workspace_files:
-
-      delegate_task(
-          background=True,
-          goal="Review PR <N> in <owner>/<repo>. Post a short comment.",
-          toolsets=["terminal", "file", "agentmint-pr-reviewer"],
-          workspace_files=[
-              {"path": "/workspace/.github_pat", "content": "<the PAT>"}
-          ],
-      )
-
-  The agent reads /workspace/.github_pat, fetches the PR diff via gh CLI,
-  writes a review to /workspace/home/pr-review/review-out.md, and posts it
-  to the PR via `gh pr comment`. Result returns to Hermes when done.
+```python
+delegate_task(
+    background=True,
+    goal="Summarize the contents of /workspace/notes.md",
+    toolsets=["terminal", "file"],
+)
 ```
 
-### Test it
+**Pattern B — routed to a specialist:**
 
-From the Hermes chat:
-
-```
-> Review PR 12 in mesutcelik/agentmint-mono. Do it in the background via
-  delegate_task using the pr-reviewer specialist. Ship the GitHub PAT —
-  it's in $GH_PAT.
-```
-
-The runner dispatches asynchronously, polls AgentMint, and resumes the conversation when the review comment has been posted. Typical wall time: 20-60s for a small PR; longer for complex diffs.
-
-### Verify
-
-```bash
-# Confirm the review comment landed
-gh pr view <N> --repo <owner>/<repo> --comments --json comments \
-  --jq '.comments[-1] | {author: .author.login, body}'
-
-# Confirm AgentMint billing
-curl -X POST https://api.agentmint.store/a2a \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $AGENTMINT_JWT" \
-  -d '{"jsonrpc":"2.0","method":"credits.history","params":{"limit":3},"id":1}' \
-  | jq '.result.entries[] | {kind, amount_usd: (.amount_microusdc/1e6), method}'
+```python
+delegate_task(
+    background=True,
+    goal="Review the diff",
+    toolsets=["terminal", "file", "agentmint-<specialist-name>"],
+)
 ```
 
-## Fleet management — beyond setup
+The runner parses `agentmint-<name>` out of the list, routes that call to that subagent, strips the entry before composing the prompt the subagent receives. First `agentmint-*` match wins; additional entries are logged + ignored.
 
-The Hermes LLM can manage subagents directly via `terminal` + curl. The `delegate_task` patch only handles dispatching; for create / list / delete / inspect, use direct `/a2a` calls.
+This `toolsets` smuggling is a workaround for Hermes' `delegate_task` not having a first-class dispatcher argument — see `docs/hermes-feature-request.md` in the [agentmint-hermes](https://github.com/mesutcelik/agentmint-hermes) repo for the upstream proposal. Once Hermes adds a `dispatcher` or `metadata` parameter, the workaround will be deprecated in favor of the first-class arg.
 
-### List subagents owned by the calling principal
-
-```bash
-curl -X POST https://api.agentmint.store/a2a \
-  -H "Authorization: Bearer $AGENTMINT_JWT" \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{}}'
-```
-
-### Add a new specialist
-
-Same shape as the `general-worker` and `pr-reviewer` mints above. Pick a specific name (`reviewer-mesutcelik-mono`, `data-analyst-q3-sales`, …) so collisions don't happen as the fleet grows.
-
-### Delete an unused specialist
-
-```bash
-curl -X POST https://api.agentmint.store/a2a \
-  -H "Authorization: Bearer $AGENTMINT_JWT" \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"agent.delete","params":{"name":"some-name"}}'
-```
-
-$0.01 dust + tears down the sandbox.
-
-### Dispatch to a specialist directly without Hermes
-
-Useful for testing the specialist in isolation:
-
-```bash
-curl -X POST https://api.agentmint.store/a2a \
-  -H "Authorization: Bearer $AGENTMINT_JWT" \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"agent.run","params":{
-        "name":"pr-reviewer","prompt":"Review PR 12 in mesutcelik/agentmint-mono.",
-        "workspace_files":[{"path":"/workspace/.github_pat","content":"<PAT>"}]
-      }}'
-```
-
-## Hermes `delegate_task` coverage (runner v0.9.x)
+## Hermes coverage (runner v0.10.x)
 
 Audited against the live Hermes delegation docs. Status notation: ✅ supported, ✅ soft hint = prompt-level only (sandbox can't structurally enforce), ❌ not implemented, n/a = different model that doesn't reach us.
 
@@ -248,12 +125,12 @@ Audited against the live Hermes delegation docs. Status notation: ✅ supported,
 | `context` | ✅ | Concatenated under `## Context`. |
 | `toolsets=["terminal", "file"]` | ✅ soft hint | Prompt restriction lines ("Do not run shell commands"). |
 | `toolsets=["web"]` | ❌ | Raises `UnsupportedToolset`. |
-| `toolsets=["agentmint-<name>", ...]` | ✅ (workaround) | **Routing directive** — adapter parses `agentmint-<name>`, dispatches to that subagent, strips entry from toolsets. Upstream Hermes proposal filed (`docs/hermes-feature-request.md`); the directive becomes a first-class parameter once that lands. |
+| `toolsets=["agentmint-<name>", ...]` | ✅ (workaround) | **Routing directive** — adapter parses `agentmint-<name>`, dispatches to that subagent, strips entry from toolsets. Upstream Hermes proposal filed; the directive becomes a first-class parameter once that lands. |
 | `role="leaf"` / `"orchestrator"` | ✅ soft hint | Prompt-level only. |
 | `max_iterations` | ✅ soft hint | Harness-dependent enforcement. |
 | `tasks=[{...}, {...}]` batch | ✅ | `dispatch_batch` — ThreadPoolExecutor; results in input order. |
-| `background=True` (PR #40946) | ✅ | The path we patch. |
-| `workspace_files=[{path, content}, ...]` | ✅ | Files written into the sandbox before the run starts; max 10 files, 10 MB each. Used to ship PATs, configs, etc. |
+| `background=True` (PR #40946) | ✅ | The path the runner patches. |
+| `workspace_files=[{path, content}, ...]` | ✅ | Files written into the sandbox before the run starts; max 10 files, 10 MB each. |
 
 ### Hermes config knobs (`~/.hermes/config.yaml` under `delegation:`)
 
@@ -270,10 +147,10 @@ Audited against the live Hermes delegation docs. Status notation: ✅ supported,
 
 | Hermes feature | Status | Notes |
 |---|---|---|
-| `delegate_task` blocks parent turn unless `background=True` | ✅ | Sync mirrors: `dispatch()` blocks until completion. Background is the only async path Hermes-side, and that's what we patch. |
+| `delegate_task` blocks parent turn unless `background=True` | ✅ | Sync mirrors: `dispatch()` blocks until completion. |
 | Interrupt cascade (parent `/stop` cancels all children) | ✅ | `cancel_event=threading.Event` fires `agent.cancel`. |
 | Status `"interrupted"` on parent interrupt | ✅ | `DispatchResult.status="interrupted"`. |
-| Hard-timeout diagnostic dumps | ❌ | We raise `DispatchTimeout`; no log file written. |
+| Hard-timeout diagnostic dumps | ❌ | The runner raises `DispatchTimeout`; no log file written. |
 
 ### Subagent restrictions
 
@@ -282,37 +159,80 @@ Audited against the live Hermes delegation docs. Status notation: ✅ supported,
 | Leaf-blocked tools (`delegation` / `clarify` / `memory` / `code_execution` / `send_message`) | n/a | AgentMint sandboxes don't expose Hermes' tool registry. Soft prompt hint only. |
 | Orchestrator-blocked tools | n/a | Same. |
 | Fresh conversation per call ("subagents know nothing") | **inverted** | This inversion is the AgentMint value prop — `/workspace/MEMORY.md` survives every dispatch to a named subagent. |
-| Credential inheritance (parent's API key passed to children) | **different model** | Hermes: subagents inherit parent's API key. AgentMint: each sandbox uses AgentMint's server-managed stored keys — no parent credential leakage. |
+| Credential inheritance | **different model** | Hermes: subagents inherit parent's API key. AgentMint: each sandbox uses AgentMint's server-managed stored keys — no parent credential leakage. |
 
-### Hermes-side UI / observability
+## Fleet management
 
-| Hermes feature | Status | Notes |
-|---|---|---|
-| `/agents` TUI overlay | partial | Dispatches go through `_async_delegation_watcher` for re-injection but don't currently register with `_active_subagents` (the TUI registry). Use `agent.list` / `agent.run.status` against AgentMint directly. |
-| Per-branch cost / token rollups | partial | Available via `agent.runs` and `agent.run.status` (`billed_usdc` field) but not surfaced into Hermes' TUI. |
-| `delegation.pause` RPC | n/a | Hermes-level; we don't observe it. |
+The Hermes LLM can run any AgentMint method through its `terminal` tool — `agent.list`, `agent.create`, `agent.delete`, etc. — by sending a curl with `Authorization: Bearer <JWT from credentials.json>`. See https://agentmint.store/SKILL.md for the full method surface.
 
 ## Pitfalls
 
 - **One JWT per principal**, shared across every subagent that principal owns. Loss = `credits.rekey` ($0.01 over x402/Tempo MPP) or fresh `credits.topup` over Stripe-Link.
-- **`name` is global + immutable.** First mint wins. Pick something specific (`pr-reviewer-mesutcelik-mono`, not `reviewer`). Released only by `agent.delete`.
+- **`name` is global + immutable.** First mint wins. Pick something specific (`reviewer-mesutcelik-mono`, not `reviewer`). Released only by `agent.delete`.
 - **Per-call pricing is end-of-run debit.** BYOK: flat $0.02. All-inclusive: actual provider cost (cache-aware estimate) + $0.02 platform fee.
 - **Stripe topup carries a passthrough fee.** A $5 Stripe topup charges ~$5.30 on Stripe; wallet is credited $5.00. x402 and Tempo MPP settle 1:1.
 - **Concurrency gate**: balance < $1 → 1 in-flight run per principal; ≥ $1 → 5. Topup to unlock parallel delegations.
-- **`workspace_files` for secrets**: when shipping a GitHub PAT or similar, ship via `workspace_files` to `/workspace/.github_pat`. Don't embed in `goal` or `context`.
 - **Don't name a specialist as `default_agent_name`.** See routing-model section above.
+- **Multiple cached JWTs**: if `~/.agentmint/credentials.json` has more than one principal, the autoload picks the first. Set `AGENTMINT_JWT` explicitly to disambiguate.
 
 ## Verification
 
 ```bash
-# Confirm the AgentMint endpoint is reachable
+# Adapter is installed + entry-point discoverable
+python -c "
+import importlib.metadata as m
+print([(e.name, e.value) for e in m.entry_points(group='hermes_agent.plugins')])
+"
+# Expect: [('agentmint', 'agentmint_hermes_runner.autoload')]
+
+# Endpoint reachable
 curl -X POST https://api.agentmint.store/a2a \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{}}'
-# → 402 with accepts[] enumerating supported rails
-
-# Confirm the runner is importable in Hermes' venv
-python -c "from agentmint_hermes_runner import install_delegate_task_wrapper; print('ok')"
+# Expect: 402 with accepts[] enumerating supported rails
 ```
 
-For setup canaries, see `examples/persistent.py` in the [agentmint-hermes](https://github.com/mesutcelik/agentmint-hermes) repo. The upstream Hermes proposal for a proper dispatcher arg on `delegate_task` lives in `docs/hermes-feature-request.md` in the same repo.
+## Example use case — code-review specialist
+
+The pattern below is one concrete way to use the skill; nothing about it is built into the runner. Use it as a reference for shaping your own specialists.
+
+```bash
+# 1. Mint a code-review specialist on top of the operator setup above
+curl -X POST https://api.agentmint.store/a2a \
+  -H "Authorization: Bearer $JWT" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{
+    "name":"pr-reviewer",
+    "mode":"all-inclusive",
+    "persona":"You review GitHub PRs. Follow the pr-review skill exactly.",
+    "skills":["mesutcelik/agentmint-skills/pr-review"]
+  }}'
+```
+
+```
+# 2. Tell the Hermes LLM the specialist exists (in the session persona):
+You have one background specialist via delegate_task: `pr-reviewer` —
+reviews GitHub PRs. To dispatch, include "agentmint-pr-reviewer" in
+toolsets and ship the GitHub PAT via workspace_files.
+```
+
+```
+# 3. From the chat:
+> review PR 42 in owner/repo. Background it via delegate_task with the
+  pr-reviewer specialist; ship the GH PAT.
+```
+
+The LLM dispatches:
+
+```python
+delegate_task(
+    background=True,
+    goal="Review PR 42 in owner/repo",
+    toolsets=["terminal", "file", "agentmint-pr-reviewer"],
+    workspace_files=[{"path": "/workspace/.github_pat", "content": "<PAT>"}],
+)
+```
+
+The runner intercepts, routes to the `pr-reviewer` subagent, polls until done, re-injects the result into Hermes. The pr-review skill itself (`mesutcelik/agentmint-skills/pr-review`) is a separate skill — see its own SKILL.md for what the specialist actually does inside the box.
+
+This use case is illustrative — adapt the pattern (different specialist, different skill, different goal shape) to whatever your Hermes session needs.
