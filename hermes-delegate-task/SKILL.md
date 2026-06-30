@@ -1,7 +1,7 @@
 ---
 name: hermes-delegate-task
 description: Teach the Hermes LLM the AgentMint routing convention. When the LLM includes `"agentmint-<subagent-name>"` in `delegate_task`'s `toolsets` list, the patched dispatcher routes that background call to a pre-minted AgentMint subagent (sandboxed, persistent MEMORY.md, pay-as-you-go USDC). Without the directive, `delegate_task` falls through to Hermes-native — AgentMint is strictly opt-in.
-version: 0.11.0
+version: 0.12.0
 author: AgentMint
 license: MIT
 platforms: [linux, macos]
@@ -41,22 +41,25 @@ delegate_task(
 
 The adapter parses `agentmint-<name>` out of the list, dispatches to that subagent, strips the directive from the toolsets before composing the prompt the subagent receives. First `agentmint-*` match wins; additional entries are logged + ignored.
 
-## Operator setup (4 commands)
+## Operator setup
 
 ```bash
-# 1. Install the runner in Hermes' Python environment
+# 1. Install the runner
 pip install agentmint-hermes-runner
 
-# 2. One-time interactive bootstrap — picks a rail, tops up the wallet,
-#    caches the JWT to ~/.agentmint/credentials.json. Does NOT mint any
-#    subagents — that's use-case-specific (step 4).
-agentmint-hermes-init
+# 2. Bootstrap a Bearer JWT via the AgentMint API. Any rail works
+#    (Stripe-Link / x402 Base / Tempo MPP). The full per-rail flow
+#    is documented at https://agentmint.store/SKILL.md.
+#    Then expose the JWT to Hermes — either as an env var…
+export AGENTMINT_JWT=<the access_token>
+#    …or cache it to ~/.agentmint/credentials.json (see "JWT cache
+#    file shape" section below).
 
 # 3. Install this skill so the LLM knows the routing convention
 hermes skills install mesutcelik/agentmint-skills/hermes-delegate-task
 
 # 4. Mint your subagents — one curl per use case
-JWT=$(jq -r '.tokens | to_entries[0].value.access_token' ~/.agentmint/credentials.json)
+JWT=$AGENTMINT_JWT
 curl -X POST https://api.agentmint.store/a2a \
   -H "Authorization: Bearer $JWT" \
   -H 'Content-Type: application/json' \
@@ -71,6 +74,23 @@ curl -X POST https://api.agentmint.store/a2a \
 ```
 
 That's the entire wiring. The runner installs a `hermes_agent.plugins` entry-point; Hermes' plugin discovery calls it at gateway boot; the patch installs in opt-in mode automatically.
+
+### JWT cache file shape
+
+If you prefer the cache file over an env var (survives shell restarts; same format the agentmint CLI uses), write it at `~/.agentmint/credentials.json`:
+
+```json
+{
+  "tokens": {
+    "link_stripe:cus_…": {
+      "access_token": "eyJhbGciOiJI…",
+      "saved_at": 1782152633
+    }
+  }
+}
+```
+
+Perms: `0700` on the directory, `0600` on the file. The autoload picks the first token in the map; set `AGENTMINT_JWT` explicitly to disambiguate when multiple principals are cached.
 
 If the LLM ever forgets the routing directive (or the user asks for a non-AgentMint task), the call simply falls through to Hermes-native `delegate_task`. AgentMint is never "stuck on" — it's a tool the LLM picks when appropriate.
 
