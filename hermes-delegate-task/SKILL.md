@@ -1,7 +1,7 @@
 ---
 name: hermes-delegate-task
 description: Teach the Hermes LLM the AgentMint routing convention. When the LLM includes `"agentmint-<subagent-name>"` in `delegate_task`'s `toolsets` list, the patched dispatcher routes that background call to a pre-minted AgentMint subagent (sandboxed, persistent MEMORY.md, pay-as-you-go USDC). Without the directive, `delegate_task` falls through to Hermes-native — AgentMint is strictly opt-in.
-version: 0.12.0
+version: 0.12.1
 author: AgentMint
 license: MIT
 platforms: [linux, macos]
@@ -43,35 +43,11 @@ The adapter parses `agentmint-<name>` out of the list, dispatches to that subage
 
 ## Operator setup
 
-```bash
-# 1. Install the runner
-pip install agentmint-hermes-runner
-
-# 2. Bootstrap a Bearer JWT via the AgentMint API. Any rail works
-#    (Stripe-Link / x402 Base / Tempo MPP). The full per-rail flow
-#    is documented at https://agentmint.store/SKILL.md.
-#    Then expose the JWT to Hermes — either as an env var…
-export AGENTMINT_JWT=<the access_token>
-#    …or cache it to ~/.agentmint/credentials.json (see "JWT cache
-#    file shape" section below).
-
-# 3. Install this skill so the LLM knows the routing convention
-hermes skills install mesutcelik/agentmint-skills/hermes-delegate-task
-
-# 4. Mint your subagents — one curl per use case
-JWT=$AGENTMINT_JWT
-curl -X POST https://api.agentmint.store/a2a \
-  -H "Authorization: Bearer $JWT" \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{
-    "name":"<specialist-name>",
-    "mode":"all-inclusive",
-    "persona":"<what this subagent does>",
-    "skills":["<optional skill refs>"]
-  }}'
-
-# 5. Restart Hermes — the autoload entry-point attaches the patch at boot
-```
+1. **Install the runner** into Hermes' Python environment. See the runner's PyPI listing at https://pypi.org/project/agentmint-hermes-runner/ for current install steps.
+2. **Bootstrap a Bearer JWT** via the AgentMint API on any rail (Stripe-Link / x402 Base / Tempo MPP). The full per-rail flow is documented at https://agentmint.store/SKILL.md. Expose the JWT to Hermes either via the `AGENTMINT_JWT` env var or by caching it under your home directory (see "JWT cache file shape" below).
+3. **Install this skill** so the LLM knows the routing convention: `hermes skills install mesutcelik/agentmint-skills/hermes-delegate-task`.
+4. **Mint your subagents** — one `agent.create` call per use case (see the AgentMint SKILL for the request shape).
+5. **Restart Hermes** — the autoload entry-point attaches the patch at boot.
 
 That's the entire wiring. The runner installs a `hermes_agent.plugins` entry-point; Hermes' plugin discovery calls it at gateway boot; the patch installs in opt-in mode automatically.
 
@@ -148,7 +124,7 @@ Files are written into the sandbox before the run starts. Max 10 files, 10 MB ea
 | `background=True` (PR #40946) | ✅ | The path the runner patches. |
 | `workspace_files` | ✅ | Files written into sandbox before run; max 10 × 10 MB. |
 
-### Hermes config knobs (`~/.hermes/config.yaml` under `delegation:`)
+### Hermes config knobs (the `delegation:` section in Hermes' user config)
 
 | Hermes feature | Status | Notes |
 |---|---|---|

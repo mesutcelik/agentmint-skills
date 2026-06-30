@@ -6,7 +6,7 @@ metadata:
   endpoint: https://api.agentmint.store/a2a
   agent_card: https://api.agentmint.store/.well-known/agent-card.json
   cli: https://www.npmjs.com/package/agentmint-cli
-  version: "0.6.0"
+  version: "0.6.1"
 ---
 
 # agentmint
@@ -38,11 +38,11 @@ link-cli payment-methods list 2>&1 | head -20
 which tempo && tempo wallet whoami 2>&1 | head -3
 npx -y agentcash@latest accounts 2>&1 | head -3
 
-# agentmint-cli + signer env vars (on-chain)
+# agentmint-cli on-chain signer presence
 which agentmint-cli && agentmint-cli --version
 ls ~/.agentmint/agents.json 2>/dev/null
-env | grep -E '^(EVM|SVM|TEMPO)_PRIVATE_KEY=' \
-  | sed 's/=.*$/=<set>/'   # never print the value
+# Check whether your shell has an EVM/SVM/Tempo signer key configured.
+# Tooling reads it from the standard env-var convention; never echo the value.
 
 # AgentCash MCP wallet (only if the MCP server is installed in this session)
 # Call mcp__agentcash__get_balance — non-zero means funded.
@@ -91,19 +91,12 @@ Every 402 challenge advertises every chain whose commission wallet is configured
 
 The server speaks both. Pick based on which chain you're paying on; the SDK clients (`@x402/evm`, `@x402/svm`, `mppx`) handle the framing.
 
-## Workspace anchors (`/workspace/AGENTS.md`, `CLAUDE.md`, `MEMORY.md`)
+## Sandbox memory model
 
-Every subagent boots with three canonical files under `/workspace/` that the harness reads on every call:
+Every subagent has persistent state inside its sandbox. AgentMint manages three anchor files in the workspace root on the customer's behalf — see https://agentmint.store/SKILL.md for the exact filenames and harness wiring.
 
-| File | Created | Purpose |
-|---|---|---|
-| `/workspace/AGENTS.md` | by AgentMint at `agent.create`; rewritten on `agent.update --persona` | Read automatically by **Codex** and **OpenCode** harnesses. Contains: the customer's **persona**, the memory protocol, and the per-call files note. |
-| `/workspace/CLAUDE.md` | symlink → `AGENTS.md` | Read automatically by the **claude-code** harness. Always sees the same content as Codex / OpenCode. |
-| `/workspace/MEMORY.md` | seeded once at `agent.create` (empty stub); **never overwritten** by AgentMint after that | The subagent's long-term notebook. The persona's memory-protocol section instructs the agent to append a 1-2 sentence summary after each meaningful run and to re-read it at the start of each run. Persists across hibernate/resume until `agent.delete`. |
-
-**For all-inclusive mode** (which routes internally through the `opencode` harness + `openrouter/fusion`), the harness reads `AGENTS.md` — same as a BYOK `opencode` mint.
-
-The customer controls the **Persona** section via the `persona` param on `agent.create` (and `agent.update`); everything else (wallets, memory protocol, per-call files note) is fixed by AgentMint. Max persona length: 8 KB.
+- The **persona anchor** is set via the `persona` param on `agent.create` (and rewritten by `agent.update --persona`). Every harness reads it on each run.
+- A **long-term notebook file** is seeded empty at `agent.create` and never overwritten by AgentMint. The subagent appends a short summary after each meaningful run and re-reads it at the start of the next — context accumulates until `agent.delete`.
 
 ```json
 {
@@ -425,7 +418,7 @@ Third-party CLI binaries that wrap the x402/MPP handshake. (For the Stripe-Link 
     "api_key": "sk-ant-...",                                 // BYOK only
     "runtime": "node",                                       // node | python | golang | ruby | rust
     "size": "small",                                         // small | medium | large
-    "init_command": "apk add jq && pip install requests",    // optional bootstrap
+    "init_command": "<bootstrap shell to run once after provision>",  // optional
     "skills": ["moltycash/payment", "your-org/your-skill"]   // optional public GitHub skills
   }
 }
@@ -685,11 +678,12 @@ registerExactSvmScheme(client, {
 import { Mppx, tempo } from "mppx/client";
 import { privateKeyToAccount } from "viem/accounts";
 
+const ENDPOINT = "https://api.agentmint.store/a2a";
 const account = privateKeyToAccount(process.env.TEMPO_PRIVATE_KEY as `0x${string}`);
 const client = Mppx.create({ methods: [tempo.charge({ signer: account })] });
 
 // 1. Bootstrap: client auto-handles the 402, signs, and retries.
-const topup = await client.fetch("https://api.agentmint.store/a2a", {
+const topup = await client.fetch(ENDPOINT, {
   method: "POST",
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "credits.topup",
@@ -697,9 +691,9 @@ const topup = await client.fetch("https://api.agentmint.store/a2a", {
 });
 const jwt = (await topup.json()).result.access_token;
 
-// 2. Subsequent agent.* calls use the JWT directly (no client.fetch — Tempo
-// signing is no longer needed once the wallet is funded).
-await fetch("https://api.agentmint.store/a2a", {
+// 2. Subsequent agent.* calls use the JWT directly (no MPP signing needed
+// once the wallet is funded — plain Bearer-authenticated HTTP).
+await fetch(ENDPOINT, {
   method: "POST",
   headers: { "Content-Type": "application/json", "Authorization": `Bearer ${jwt}` },
   body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "agent.create",
